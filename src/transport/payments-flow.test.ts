@@ -319,7 +319,10 @@ describe.serial('payments fake flow (transport-level)', () => {
       }),
     );
 
-    const processor = new FakePaymentProcessor({ verifyDelayMs: 1 });
+    const processor = new FakePaymentProcessor({
+      verifyDelayMs: 1,
+      pmi: 'pmi-a',
+    });
     const pricedCapabilities = [
       {
         method: 'tools/call',
@@ -389,7 +392,7 @@ describe.serial('payments fake flow (transport-level)', () => {
     await mcpServer.close();
   }, 20000);
 
-  test('PMI selection: falls back to server order when no intersection', async () => {
+  test('PMI selection: disjoint sets refuse before invoice creation or wallet work', async () => {
     const serverSK = generateSecretKey();
     const serverPrivateKey = bytesToHex(serverSK);
     const serverPublicKey = getPublicKey(serverSK);
@@ -415,6 +418,8 @@ describe.serial('payments fake flow (transport-level)', () => {
       pmi: 'pmi-c',
       verifyDelayMs: 1,
     });
+    const createB = spyOn(processorB, 'createPaymentRequired');
+    const createC = spyOn(processorC, 'createPaymentRequired');
     const pricedCapabilities = [
       {
         method: 'tools/call',
@@ -441,6 +446,7 @@ describe.serial('payments fake flow (transport-level)', () => {
 
     const clientPrivateKey = bytesToHex(generateSecretKey());
     const handlers = [new FakePaymentHandler({ pmi: 'pmi-a', delayMs: 1 })];
+    const wallet = spyOn(handlers[0], 'handle');
 
     const clientTransport = new NostrClientTransport({
       signer: new PrivateKeySigner(clientPrivateKey),
@@ -462,15 +468,21 @@ describe.serial('payments fake flow (transport-level)', () => {
       originalOnMessage?.(msg);
     };
 
-    await client.callTool({
-      name: 'add',
-      arguments: { a: 1, b: 2 },
-    });
-
-    expect(observedPaymentPmi).toBe('pmi-b');
-
-    await client.close();
-    await mcpServer.close();
+    try {
+      await expect(
+        client.callTool({ name: 'add', arguments: { a: 1, b: 2 } }),
+      ).rejects.toThrow('mutually supported');
+      expect(observedPaymentPmi).toBeUndefined();
+      expect(createB).not.toHaveBeenCalled();
+      expect(createC).not.toHaveBeenCalled();
+      expect(wallet).not.toHaveBeenCalled();
+    } finally {
+      createB.mockRestore();
+      createC.mockRestore();
+      wallet.mockRestore();
+      await client.close();
+      await mcpServer.close();
+    }
   }, 20000);
 
   test('PMI selection: when client advertises none, uses server order', async () => {
@@ -832,10 +844,12 @@ describe.serial('payments fake flow (transport-level)', () => {
     expect(acceptedSent).toBe(0);
   });
 
-  test('verification timeout clears pending state (ttl-based)', async () => {
+  test('verification timeout preserves invoice identity for event replay', async () => {
+    let invoices = 0;
     const processor: PaymentProcessor = {
       pmi: 'fake',
       async createPaymentRequired(params) {
+        invoices++;
         return {
           amount: params.amount,
           pay_req: `fake:${params.requestEventId}:${params.clientPubkey}:${params.amount}`,
@@ -899,10 +913,10 @@ describe.serial('payments fake flow (transport-level)', () => {
     expect(elapsed).toBeLessThan(3000);
     expect(forwarded).toBe(0);
 
-    // Retry should not be black-holed: it should attempt again and time out again.
-    await expect(mw(message, ctx, forward)).rejects.toThrow(
-      /verifyPayment timed out/,
-    );
+    // The same admitted event cannot create a second payment after its lease expires.
+    await mw(message, ctx, forward);
+    expect(invoices).toBe(1);
+    expect(forwarded).toBe(0);
   }, 20000);
 
   test('client respects payment TTL without timing out even when TTL > MCP timeout (immediate-heartbeat regression)', async () => {
@@ -1190,8 +1204,7 @@ describe.serial('payments fake flow (transport-level)', () => {
 
     const event = await capturePromise;
     const piTag = event.tags.find((t) => t[0] === 'payment_interaction') as
-      | readonly string[]
-      | undefined;
+      readonly string[] | undefined;
     expect(piTag?.[1]).toBe('explicit_gating');
 
     await client.close();
@@ -1612,7 +1625,8 @@ describe.serial('payments fake flow (transport-level)', () => {
           {
             method: 'tools/call',
             name: 'add',
-            amount: 1, // static fallback; resolvePrice overrides this
+            amount: 1,
+            maxAmount: 42, // Inclusive advertised range for dynamic quotes.
             currencyUnit: 'test',
           },
         ],

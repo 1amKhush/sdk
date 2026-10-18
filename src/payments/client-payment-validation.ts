@@ -6,13 +6,14 @@ import type {
   PaymentRequiredErrorData,
 } from './types.js';
 
+import {
+  paymentAmountSchema as amountSchema,
+  paymentPmiSchema as pmiSchema,
+  paymentOptionSchema,
+} from './payment-option-schema.js';
+export { paymentOptionSchema as clientPaymentOptionSchema } from './payment-option-schema.js';
+
 const MAX_TIMER_MS = 2_147_483_647;
-const amountSchema = z
-  .number()
-  .finite()
-  .nonnegative()
-  .max(Number.MAX_SAFE_INTEGER);
-const pmiSchema = z.string().regex(/^[a-z0-9-]+$/);
 const timerSchema = z.number().finite().positive().max(MAX_TIMER_MS);
 
 /** Internal payment failure with a stable application-visible reason. */
@@ -26,28 +27,10 @@ export class ClientPaymentError extends Error {
   }
 }
 
-/** Runtime offer schema; unknown extension metadata is preserved. */
-export const clientPaymentOptionSchema = z.object({
-  amount: amountSchema,
-  pmi: pmiSchema,
-  pay_req: z
-    .string()
-    .min(1)
-    .refine((value) => value.trim().length > 0),
-  description: z.string().optional(),
-  ttl: z
-    .number()
-    .finite()
-    .positive()
-    .max(Number.MAX_SAFE_INTEGER / 1000)
-    .optional(),
-  _meta: z.record(z.string(), z.unknown()).optional(),
-});
-
 const requiredSchema = z.object({
   instructions: z.string().optional(),
   payment_options: z
-    .array(clientPaymentOptionSchema)
+    .array(paymentOptionSchema)
     .min(1)
     .max(100)
     .refine((options) => {
@@ -81,7 +64,7 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
 
 /** Validates a transparent payment offer before invoking policy or wallet code. */
 export function parseClientPaymentOption(input: unknown): PaymentOption {
-  return parse(clientPaymentOptionSchema, input);
+  return parse(paymentOptionSchema, input);
 }
 
 /** Validates all explicit options, including options that might not be selected. */
