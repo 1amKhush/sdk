@@ -299,6 +299,8 @@ export class ServerInboundCoordinator {
       ): Promise<boolean> => {
         const mw = middlewares[index];
         if (!mw) {
+          if (isJSONRPCRequest(msg))
+            this.deps.openStreamFactory.admitInvocation(String(msg.id));
           const forwarded = await this.deps.forwardMessage(msg, event.pubkey);
           if (forwarded) {
             this.trackSubscription(msg, event.pubkey);
@@ -312,7 +314,12 @@ export class ServerInboundCoordinator {
         return forwarded;
       };
 
+      const reservationOwner = {};
       if (isJSONRPCRequest(inboundMessage)) {
+        this.deps.openStreamFactory.reserveInvocation(
+          event.id,
+          reservationOwner,
+        );
         this.handleIncomingRequest(
           event,
           event.id,
@@ -342,7 +349,7 @@ export class ServerInboundCoordinator {
       void dispatch(0, inboundMessage)
         .then((forwarded) => {
           if (!forwarded) {
-            this.cleanupDroppedRequest(inboundMessage);
+            this.cleanupDroppedRequest(inboundMessage, reservationOwner);
           }
         })
         .catch((err: unknown) => {
@@ -356,7 +363,7 @@ export class ServerInboundCoordinator {
           );
           // A failed chain never forwards and (normally) never responds: the
           // request's reserved state must be released here too, or it leaks.
-          this.cleanupDroppedRequest(inboundMessage);
+          this.cleanupDroppedRequest(inboundMessage, reservationOwner);
         });
     } catch (error) {
       this.deps.logger.error('Error in authorizeAndProcessEvent', {
@@ -385,14 +392,15 @@ export class ServerInboundCoordinator {
     request.id = eventId;
 
     const progressToken = request.params?._meta?.progressToken;
-    this.deps.correlationStore.registerEventRoute(
-      eventId,
-      clientPubkey,
-      originalRequestId,
-      progressToken ? String(progressToken) : undefined,
-      wrapKind,
-      this.deps.shouldInjectRequestEventId ? event : undefined,
-    );
+    if (!this.deps.correlationStore.hasEventRoute(eventId))
+      this.deps.correlationStore.registerEventRoute(
+        eventId,
+        clientPubkey,
+        originalRequestId,
+        progressToken ? String(progressToken) : undefined,
+        wrapKind,
+        this.deps.shouldInjectRequestEventId ? event : undefined,
+      );
 
     // Create the CEP-41 open-stream writer and bind it to the request's
     // `_meta.stream` at the single creation site, keyed by the same `eventId`
@@ -462,13 +470,18 @@ export class ServerInboundCoordinator {
    * route and the open-stream writer reservation together, since a dropped
    * request never produces the normal-path response that would reap them.
    */
-  public cleanupDroppedRequest(message: JSONRPCMessage): void {
+  public cleanupDroppedRequest(message: JSONRPCMessage, owner?: object): void {
     if (!isJSONRPCRequest(message)) {
       return;
     }
     const eventId = String(message.id);
+    if (
+      (owner && !this.deps.openStreamFactory.ownsReservation(eventId, owner)) ||
+      this.deps.openStreamFactory.ownsInvocation(eventId)
+    )
+      return;
     this.deps.correlationStore.popEventRoute(eventId);
-    this.deps.openStreamFactory.releaseUnusedWriter(eventId);
+    this.deps.openStreamFactory.releaseUnusedWriter(eventId, true);
   }
 
   /**

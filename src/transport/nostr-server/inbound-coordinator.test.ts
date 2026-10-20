@@ -66,6 +66,10 @@ function createCoordinator(options?: {
       options?.authorizationPolicy ?? new AuthorizationPolicy(),
     openStreamFactory: {
       createWriterIfEnabled: () => undefined,
+      admitInvocation: () => undefined,
+      reserveInvocation: () => undefined,
+      ownsReservation: () => true,
+      ownsInvocation: () => false,
       inputStreamIfEnabled: () => undefined,
       releaseUnusedWriter: () => undefined,
     } as unknown as ServerOpenStreamFactory,

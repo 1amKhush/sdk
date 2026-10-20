@@ -430,6 +430,7 @@ export class NostrServerTransport
     );
 
     this.outboundResponseRouter = new OutboundResponseRouter({
+      closeSignal: this.closeSignal,
       correlationStore: this.correlationStore,
       sessionStore: this.sessionStore,
       announcementManager: this.announcementManager,
@@ -588,6 +589,13 @@ export class NostrServerTransport
       this.onerror?.(error instanceof Error ? error : new Error(String(error)));
       this.logAndRethrowError('Error starting NostrServerTransport', error);
     }
+  }
+
+  /** Prevents signing or queued result work from publishing after transport shutdown. */
+  protected override async publishEvent(event: NostrEvent): Promise<void> {
+    this.closeSignal.throwIfAborted();
+    await this.relayHandler.publish(event, { abortSignal: this.closeSignal });
+    this.closeSignal.throwIfAborted();
   }
 
   /** Registers cleanup for resources explicitly owned by a transport integration. */
@@ -832,19 +840,25 @@ export class NostrServerTransport
     correlatedEventId?: string,
     wrapKindHint?: number,
   ): Promise<void> {
+    const retained = correlatedEventId
+      ? this.correlationStore.peekRouteSnapshot(correlatedEventId)
+      : undefined;
+    const snapshot =
+      retained?.route.clientPubkey === clientPubkey ? retained : undefined;
     if (this.openStreamFactory.isClientEvicted(clientPubkey)) {
       // A probe-timeout eviction blacklists the pubkey until its pending
       // response routes (takePendingEviction). If the client has since
       // re-established a session, lift the blacklist instead of refusing —
       // otherwise a probe timeout whose response never routes permanently
       // breaks notification delivery (incl. payment_required) for that client.
-      if (!this.sessionStore.getSession(clientPubkey)) {
+      if (!snapshot?.session && !this.sessionStore.getSession(clientPubkey)) {
         throw new Error(`No active session found for client: ${clientPubkey}`);
       }
       this.openStreamFactory.clearClientEviction(clientPubkey);
     }
 
-    const session = this.sessionStore.getSession(clientPubkey);
+    const session =
+      snapshot?.session ?? this.sessionStore.getSession(clientPubkey);
     if (!session) {
       throw new Error(`No active session found for client: ${clientPubkey}`);
     }
@@ -866,7 +880,10 @@ export class NostrServerTransport
       fallbackWrapKind:
         wrapKindHint ??
         (correlatedEventId
-          ? this.correlationStore.getEventRoute(correlatedEventId)?.wrapKind
+          ? (
+              snapshot?.route ??
+              this.correlationStore.getEventRoute(correlatedEventId)
+            )?.wrapKind
           : undefined),
     });
 
