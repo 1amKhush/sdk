@@ -1,5 +1,5 @@
 /** Initial durable payment schema; initialization runs under a migration lock. */
-export const PAYMENT_STATE_SCHEMA_VERSION = 1;
+export const PAYMENT_STATE_SCHEMA_VERSION = 2;
 
 /** PostgreSQL schema shared by all payment namespaces. */
 export const PAYMENT_STATE_MIGRATION = `

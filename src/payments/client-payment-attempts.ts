@@ -1,3 +1,8 @@
+import {
+  emitPaymentOutcome,
+  paymentInvoiceDigest,
+  type PaymentOutcomeOptions,
+} from './payment-outcomes.js';
 import type { PaymentOption } from './types.js';
 import { ClientPaymentError } from './client-payment-validation.js';
 
@@ -21,7 +26,10 @@ export class ClientPaymentAttempts {
     { amount: number; attempt: ClientPaymentAttempt }
   >();
 
-  public constructor(private readonly maxEntries: number) {}
+  public constructor(
+    private readonly maxEntries: number,
+    private readonly outcomes: PaymentOutcomeOptions = {},
+  ) {}
 
   private key(option: PaymentOption): string {
     return JSON.stringify([option.pmi, option.pay_req]);
@@ -60,6 +68,11 @@ export class ClientPaymentAttempts {
   ): ClientPaymentAttempt {
     const unique = new Map(options.map((option) => [this.key(option), option]));
     if (this.entries.size + unique.size > this.maxEntries) {
+      emitPaymentOutcome(this.outcomes, {
+        kind: 'exhausted',
+        atMs: Date.now(),
+        identity: 'client_payment_attempts',
+      });
       throw new ClientPaymentError(
         'payment_attempt_capacity',
         'Client payment attempt capacity reached',
@@ -74,6 +87,19 @@ export class ClientPaymentAttempts {
       complete: (outcome): void => {
         if (attempt.outcome !== 'in_flight') return;
         attempt.outcome = outcome;
+        for (const option of unique.values())
+          emitPaymentOutcome(this.outcomes, {
+            kind:
+              outcome === 'handled'
+                ? 'attempt_handled'
+                : outcome === 'declined'
+                  ? 'attempt_declined'
+                  : 'unknown',
+            atMs: Date.now(),
+            identity: paymentInvoiceDigest(this.key(option)),
+            invoiceDigest: paymentInvoiceDigest(option.pay_req),
+            ...(outcome === 'unknown' && { remedy: 'reconcile_settlement' }),
+          });
         signal.removeEventListener('abort', onAbort);
         resolve();
       },
@@ -82,6 +108,13 @@ export class ClientPaymentAttempts {
     for (const [key, option] of unique) {
       this.entries.set(key, { amount: option.amount, attempt });
     }
+    for (const option of unique.values())
+      emitPaymentOutcome(this.outcomes, {
+        kind: 'attempt',
+        atMs: Date.now(),
+        identity: paymentInvoiceDigest(this.key(option)),
+        invoiceDigest: paymentInvoiceDigest(option.pay_req),
+      });
     signal.addEventListener('abort', onAbort, { once: true });
     if (signal.aborted) onAbort();
     return attempt;

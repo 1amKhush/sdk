@@ -186,7 +186,10 @@ export function paymentStoreContract(
         };
         const claimed = await store.admit(retry);
         expect(claimed.status).toBe('claimed');
-        expect(required(claimed.record).retainUntilMs).toBeGreaterThanOrEqual(
+        expect(required(claimed.record).retainUntilMs).toBeNull();
+        expect(
+          required(claimed.record).replayExpiresAtMs,
+        ).toBeGreaterThanOrEqual(
           (now + 30) * 1000 + store.policy.replayWindowMs,
         );
         expect((await store.admit(input)).status).toBe('duplicate');
@@ -340,7 +343,7 @@ export function paymentStoreContract(
     test('expired reservations fence slow pricing and every old verifier mutation', async () =>
       run(async ({ store, peer, advance }) => {
         const input = { ...admission(), leaseMs: 150 };
-        const old = await bind(store, input);
+        const old = required((await store.admit(input)).record);
         await advance(220);
         const next = await peer.admit({
           ...input,
@@ -363,7 +366,7 @@ export function paymentStoreContract(
           await store.transition({
             ...fence,
             type: 'bind',
-            invoice: required(old.invoice),
+            invoice: { amount: 1, pmi: 'fake', pay_req: 'superseded-invoice' },
             leaseMs: 10000,
           }),
         ).toBe(false);
@@ -371,9 +374,8 @@ export function paymentStoreContract(
           required(next.record).generation,
         );
         expect(
-          (await store.read(JSON.stringify(['attempt', old.generation])))
-            ?.invoice?.pay_req,
-        ).toBe(required(old.invoice).pay_req);
+          await store.read(JSON.stringify(['attempt', old.generation])),
+        ).toBeUndefined();
       }));
 
     test('an expired invoice-creation lease cannot mint another invoice', async () =>

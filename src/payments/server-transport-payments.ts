@@ -1,3 +1,5 @@
+import { PaymentResultRecovery } from './payment-recovery.js';
+import { ObservedPaymentStateStore } from './observed-payment-state-store.js';
 import type { NostrServerTransport } from '../transport/nostr-server-transport.js';
 import type { PaymentInteractionPolicy } from './types.js';
 import type { ServerPaymentsOptions } from './server-payments.js';
@@ -37,7 +39,17 @@ export function withServerPayments(
     );
   }
   validateServerPaymentOptions(options);
-  const stateStore = serverPaymentStore(options);
+  const backend = serverPaymentStore(options);
+  const stateStore =
+    options.onPaymentOutcome || options.paymentJournal
+      ? new ObservedPaymentStateStore(backend, options)
+      : backend;
+  transport.setPaymentResultRecovery(
+    new PaymentResultRecovery(stateStore, {
+      ...options,
+      publicationLeaseMs: options.paymentTtlMs ?? 300_000,
+    }),
+  );
   options = { ...options, stateStore };
   paymentsRegistered.add(transport);
 
@@ -88,12 +100,25 @@ export function withServerPayments(
   transport.addInboundMiddleware(
     createServerPaymentsMiddleware({
       sender: transport,
+      onPaymentPending: (id) =>
+        transport.capturePaymentRouteSnapshot(
+          id,
+          Number.MAX_SAFE_INTEGER - Date.now(),
+        ),
       options,
       processorsByPmi,
       // Snapshot the correlation route when an invoice goes out so the paid
       // response survives route-pop (duplicate cleanup) and session eviction.
-      onInvoiceIssued: ({ requestEventId, snapshotTtlMs }) =>
-        transport.capturePaymentRouteSnapshot(requestEventId, snapshotTtlMs),
+      onInvoiceIssued: ({ requestEventId }) =>
+        transport.capturePaymentRouteSnapshot(
+          requestEventId,
+          Number.MAX_SAFE_INTEGER - Date.now(),
+        ),
+      onPaidDuplicate: (record) =>
+        transport.retryPaymentResult(
+          record.clientPubkey,
+          record.requestEventId,
+        ),
       abortSignal,
     }),
   );
@@ -107,6 +132,16 @@ export function withServerPayments(
       createExplicitGatingMiddleware({
         options,
         authorizationStore,
+        onPaidDuplicate: (record) =>
+          transport.retryPaymentResult(
+            record.clientPubkey,
+            record.requestEventId,
+          ),
+        onPaymentPending: (id) =>
+          transport.capturePaymentRouteSnapshot(
+            id,
+            Number.MAX_SAFE_INTEGER - Date.now(),
+          ),
         sendResponse: async (clientPubkey, response, requestEventId) => {
           await transport.sendTargetedResponse(
             clientPubkey,
@@ -115,6 +150,11 @@ export function withServerPayments(
           );
         },
         processorsByPmi,
+        onInvoiceIssued: ({ requestEventId }) =>
+          transport.capturePaymentRouteSnapshot(
+            requestEventId,
+            Number.MAX_SAFE_INTEGER - Date.now(),
+          ),
         abortSignal,
       }),
     );

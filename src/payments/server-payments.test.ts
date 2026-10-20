@@ -139,8 +139,11 @@ describe('createServerPaymentsMiddleware pending-payment retention', () => {
     expect(harness.invoiceCount('evt1')).toBe(1);
 
     // The durable event record refuses another invoice even after the local run ends.
-    await harness.run('evt1');
+    await expect(harness.run('evt1')).rejects.toThrow(
+      'payment rail unreachable',
+    );
     expect(harness.invoiceCount('evt1')).toBe(1);
+    expect(harness.forwards()).toBe(0);
   });
 
   test('pre-invoice failure deletes the entry, so the retry mints exactly one invoice', async () => {

@@ -1,3 +1,4 @@
+import type { PaymentResultDelivery } from './payment-delivery.js';
 import type { PaymentInteractionMode, PaymentOption } from './types.js';
 
 /** Immutable identity captured from a verified, unwrapped Nostr event. */
@@ -54,6 +55,10 @@ export interface PaymentStateRecord {
   invoiceExpiresAtMs?: number;
   grantExpiresAtMs?: number;
   reason?: string;
+  reconciliation?: { owner: string; leaseExpiresAtMs: number };
+  offerStatus?: 'published' | 'unknown';
+  settlement?: { verifiedAtMs: number };
+  delivery?: PaymentResultDelivery;
 }
 
 /** Atomic claim-or-reserve request. Callers never compose a read and write. */
@@ -83,11 +88,30 @@ export type PaymentStateTransition = {
 } & (
   | {
       type:
-        'issuing' | 'consume' | 'dispatch' | 'release' | 'reject' | 'expire';
+        | 'issuing'
+        | 'consume'
+        | 'dispatch'
+        | 'release'
+        | 'reject'
+        | 'expire'
+        | 'offer_published';
     }
   | { type: 'bind'; invoice: PaymentOption; leaseMs: number }
   | { type: 'grant'; ttlMs: number }
   | { type: 'uncertain'; reason: string }
+  | { type: 'settled'; ttlMs: number; owner?: string }
+  | { type: 'reconciliation_claim'; owner: string; leaseMs: number }
+  | { type: 'reconciliation_release'; owner: string }
+  | { type: 'result'; delivery: PaymentResultDelivery }
+  | { type: 'publication_claim'; owner: string; leaseMs: number }
+  | {
+      type: 'publication_progress';
+      leaseMs?: number;
+      owner: string;
+      frames: number;
+      chunkSizeBytes?: number;
+    }
+  | { type: 'published' | 'publication_failed'; owner: string }
 );
 
 /**

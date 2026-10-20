@@ -1,3 +1,7 @@
+import {
+  emitPaymentOutcome,
+  paymentInvoiceDigest,
+} from './payment-outcomes.js';
 import type { Transport } from '@contextvm/mcp-sdk/shared/transport';
 import {
   isJSONRPCNotification,
@@ -135,7 +139,6 @@ export function withClientPayments(
       : Promise.resolve();
     return disposing;
   };
-
   const progress = new ClientPaymentProgress(
     options.syntheticProgressIntervalMs ??
       DEFAULT_SYNTHETIC_PROGRESS_INTERVAL_MS,
@@ -148,6 +151,22 @@ export function withClientPayments(
     code = -32000,
     data: Record<string, unknown> = {},
   ): void => {
+    const kind =
+      error.reason === 'payment_request_capacity'
+        ? 'evicted'
+        : error.reason === 'payment_deadline_exceeded'
+          ? 'expired'
+          : ['payment_limit_exceeded', 'payment_attempt_capacity'].includes(
+                error.reason,
+              )
+            ? 'exhausted'
+            : undefined;
+    if (kind)
+      emitPaymentOutcome(options, {
+        kind,
+        atMs: Date.now(),
+        identity: paymentInvoiceDigest(state.key),
+      });
     if (state.id === undefined) {
       onerror?.(error);
       return;
@@ -169,6 +188,7 @@ export function withClientPayments(
   });
   const attempts = new ClientPaymentAttempts(
     options.maxTrackedPaymentAttempts ?? 1000,
+    options,
   );
   const handlers = new Map<string, PaymentHandler>();
   for (const handler of options.handlers ?? []) {
@@ -307,7 +327,7 @@ export function withClientPayments(
           JSON.stringify(state.request),
         ) as NonNullable<typeof state.request>,
         abortSignal: state.controller.signal,
-      deadlineMs: state.deadline,
+        deadlineMs: state.deadline,
       });
       if (!lifecycle.isActive(state)) return;
       if (result.paid) {
@@ -656,7 +676,11 @@ export function withClientPayments(
     async close(): Promise<void> {
       lifecycle.close();
       progress.clear();
-      try { await transport.close(); } finally { await disposeHandlers(); }
+      try {
+        await transport.close();
+      } finally {
+        await disposeHandlers();
+      }
     },
   };
   clientPaymentsWrapped.add(transport);

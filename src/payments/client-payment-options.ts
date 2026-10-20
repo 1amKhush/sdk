@@ -1,3 +1,4 @@
+import type { PaymentOutcomeOptions } from './payment-outcomes.js';
 import type { JSONRPCRequest } from '@contextvm/mcp-sdk/types.js';
 import type { OriginalRequestContext } from '../transport/nostr-client/correlation-store.js';
 import type {
@@ -24,7 +25,7 @@ export interface ClientPaymentLimits {
 }
 
 /** Client-side CEP-8 payment handlers, approval policy, and lifecycle limits. */
-export interface ClientPaymentsOptions {
+export interface ClientPaymentsOptions extends PaymentOutcomeOptions {
   /**
    * Payment handlers for in-band (programmatic) payment, indexed by their
    * {@link PaymentHandler.pmi}. Each handler's `pmi` is advertised to the

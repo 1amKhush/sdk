@@ -89,6 +89,22 @@ export class PostgresPaymentStateStore implements PaymentStateStore {
           JSON.stringify(this.policy),
         ],
       );
+      const current = await client.query<{ version: number }>(
+        'SELECT version FROM contextvm_payment_namespaces WHERE namespace = $1 FOR UPDATE',
+        [this.namespace],
+      );
+      if (current.rows[0]?.version === 1) {
+        await client.query(
+          `UPDATE contextvm_payment_records SET retain_until_ms = NULL,
+          record = jsonb_set(record, '{retainUntilMs}', 'null'::jsonb)
+          WHERE namespace = $1 AND (record ? 'invoice' OR phase IN ('consumed', 'dispatched'))`,
+          [this.namespace],
+        );
+        await client.query(
+          'UPDATE contextvm_payment_namespaces SET version = $2 WHERE namespace = $1',
+          [this.namespace, PAYMENT_STATE_SCHEMA_VERSION],
+        );
+      }
       await this.lockNamespace(client);
     }, false);
     this.initialized = true;
@@ -103,7 +119,8 @@ export class PostgresPaymentStateStore implements PaymentStateStore {
       const { now, generation } = await this.lockNamespace(client);
       await client.query(
         `DELETE FROM contextvm_payment_records WHERE namespace = $1 AND retain_until_ms <= $2
-         AND NOT (phase IN ('reserved', 'issuing', 'pending') AND lease_expires_ms > $2)`,
+         AND NOT (phase IN ('reserved', 'issuing', 'pending') AND lease_expires_ms > $2)
+         AND NOT ((record ? 'invoice' AND NOT record ? 'settlement') OR (record ? 'invoice' AND phase IN ('consumed', 'dispatched') AND COALESCE(record->'delivery'->>'status', '') <> 'published'))`,
         [this.namespace, now],
       );
       const keys = [input.key];

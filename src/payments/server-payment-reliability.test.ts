@@ -64,7 +64,7 @@ function processor(): PaymentProcessor {
 
 describe('server attempt generation fences', () => {
   for (const outcome of ['resolve', 'reject'] as const) {
-    test(`old verifier ${outcome} cannot mutate a replacement generation`, async () => {
+    test(`late verifier ${outcome} cannot trigger a replacement invoice or duplicate grant`, async () => {
       let now = Date.now();
       const store = new InMemoryPaymentStateStore({}, () => now);
       const old = deferred<Record<string, never>>();
@@ -99,17 +99,19 @@ describe('server attempt generation fences', () => {
       now += 10001;
       await middleware(request('replacement'), context, async () => {});
       const replacement = (await store.read(authorizationKey))!;
-      expect(replacement.generation).not.toBe(oldGeneration);
+      expect(replacement.generation).toBe(oldGeneration);
       if (outcome === 'resolve') old.resolve({});
       else old.reject(new Error('old failure'));
       await Bun.sleep(0);
-      expect((await store.read(authorizationKey))?.phase).toBe('pending');
+      expect(['pending', 'unknown', 'granted']).toContain(
+        (await store.read(authorizationKey))?.phase ?? 'missing',
+      );
       expect((await store.read(authorizationKey))?.generation).toBe(
         replacement.generation,
       );
-      expect(invoices).toBe(2);
+      expect(invoices).toBe(1);
       expect(replies.map((response) => response.error.code)).toEqual([
-        -32042, -32042,
+        -32042, -32043,
       ]);
       current.resolve({});
       await Bun.sleep(0);
@@ -118,7 +120,7 @@ describe('server attempt generation fences', () => {
         forwards++;
       });
       expect(forwards).toBe(1);
-      expect(invoices).toBe(2);
+      expect(invoices).toBe(1);
     });
   }
 

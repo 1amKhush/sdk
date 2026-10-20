@@ -1,3 +1,4 @@
+import { PaymentResultRecovery } from '../payments/payment-recovery.js';
 import {
   type ListToolsResult,
   isJSONRPCNotification,
@@ -237,6 +238,7 @@ export class NostrServerTransport
   private readonly eventPipeline: ServerEventPipeline;
   private readonly inboundCoordinator: ServerInboundCoordinator;
   private readonly inboundNotificationDispatcher: InboundNotificationDispatcher;
+  private paymentResultRecovery?: PaymentResultRecovery;
   private readonly outboundResponseRouter: OutboundResponseRouter;
   private readonly outboundNotificationBroadcaster: OutboundNotificationBroadcaster;
 
@@ -814,6 +816,29 @@ export class NostrServerTransport
    * popped by duplicate-delivery cleanup or the idle paying client's session
    * was LRU-evicted while payment settled (CEP-8).
    */
+  /** Attaches the same durable payment store used by authorization to result publication. */
+  public setPaymentResultRecovery(recovery: PaymentResultRecovery): void {
+    this.paymentResultRecovery = recovery;
+    this.outboundResponseRouter.setPaymentResultJournal(recovery);
+  }
+
+  /** Republishes a recorded paid result without calling the application handler. */
+  public async retryPaymentResult(
+    clientPubkey: string,
+    requestEventId: string,
+  ): Promise<void> {
+    if (this.closeSignal.aborted) throw new Error('Transport is closed');
+    if (!this.paymentResultRecovery)
+      throw new Error('Payment result recovery is not configured');
+    await this.paymentResultRecovery.replay(
+      clientPubkey,
+      requestEventId,
+      (snapshot) =>
+        this.correlationStore.restoreRouteSnapshot(requestEventId, snapshot),
+      (response) => this.outboundResponseRouter.route(response),
+    );
+  }
+
   public capturePaymentRouteSnapshot(
     requestEventId: string,
     ttlMs: number,

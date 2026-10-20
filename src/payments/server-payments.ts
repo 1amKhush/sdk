@@ -1,3 +1,4 @@
+import type { PaymentOutcomeOptions } from './payment-outcomes.js';
 import { isJsonRpcRequest } from './types.js';
 import type {
   CorrelatedNotificationSender,
@@ -8,6 +9,7 @@ import type {
   ServerMiddlewareFn,
 } from './types.js';
 import type {
+  PaymentStateRecord,
   PaymentStatePolicy,
   PaymentStateStore,
 } from './payment-state-store.js';
@@ -33,9 +35,10 @@ import {
 import { validateServerPaymentOptions } from './server-payment-validation.js';
 
 /** Server-side payment policy; both lifecycles share one atomic state store. */
-export interface ServerPaymentsOptions extends Partial<PaymentStatePolicy> {
+export interface ServerPaymentsOptions
+  extends Partial<PaymentStatePolicy>, PaymentOutcomeOptions {
   processors: readonly PaymentProcessor[];
-  /** Dispose configured processors only when exclusively owned by this transport. @default false */
+  /** Dispose configured processors on transport close only when they are exclusively owned. @default false */
   disposeProcessorsOnClose?: boolean;
   pricedCapabilities: readonly PricedCapability[];
   /** Optional per-request quote, constrained by the advertised inclusive range. */
@@ -68,6 +71,8 @@ export function createServerPaymentsMiddleware(params: {
     snapshotTtlMs: number;
   }) => void;
   abortSignal?: AbortSignal;
+  onPaymentPending?: (requestEventId: string) => void;
+  onPaidDuplicate?: (record: PaymentStateRecord) => Promise<void>;
 }): ServerMiddlewareFn {
   const { sender, options, abortSignal } = params;
   validateServerPaymentOptions(options);
@@ -98,6 +103,7 @@ export function createServerPaymentsMiddleware(params: {
       'transparent',
       leaseMs,
     );
+    params.onPaymentPending?.(admission.requestEventId);
     const existing = running.get(admission.key);
     if (existing) {
       await existing;
@@ -120,33 +126,61 @@ export function createServerPaymentsMiddleware(params: {
     };
     const work = (async (): Promise<void> => {
       const admitted = await store.admit(admission);
-      if (admitted.status !== 'reserved') {
-        if (admitted.status !== 'duplicate')
+      const recovering =
+        admitted.status === 'duplicate' &&
+        admitted.record?.invoice &&
+        ['pending', 'unknown', 'expired'].includes(admitted.record.phase);
+      if (admitted.status !== 'reserved' && !recovering) {
+        if (admitted.status === 'duplicate' && admitted.record?.delivery)
+          await params.onPaidDuplicate?.(admitted.record);
+        else if (admitted.status !== 'duplicate')
           await reject(`Payment admission refused: ${admitted.status}`);
         return;
       }
       const record = admitted.record;
+      if (!record) throw new Error('Payment admission record missing');
       const fence = { key: record.key, generation: record.generation };
       try {
         if (abortSignal?.aborted) {
           await store.transition({ ...fence, type: 'release' });
           return;
         }
-        const initiated = await resolveAndInitiatePayment({
-          message,
-          priced,
-          requestEventId: admission.requestEventId,
-          clientPubkey: ctx.clientPubkey,
-          clientPmis: ctx.clientPmis,
-          options,
-          processorsByPmi,
-          context: { abortSignal, deadlineMs: record.leaseExpiresAtMs },
-          beforeInvoice: async () => {
-            if (abortSignal?.aborted) return false;
-            const owned = await store.transition({ ...fence, type: 'issuing' });
-            return owned && !abortSignal?.aborted;
-          },
-        });
+        const recoveredInvoice = recovering ? record.invoice : undefined;
+        const recoveredProcessor = recoveredInvoice
+          ? processorsByPmi.get(recoveredInvoice.pmi)
+          : undefined;
+        if (recoveredInvoice && !recoveredProcessor)
+          throw new Error('Recorded payment processor is unavailable');
+        const initiated =
+          recoveredInvoice && recoveredProcessor
+            ? {
+                kind: 'payment_required' as const,
+                paymentRequired: recoveredInvoice,
+                mergedMeta: recoveredInvoice._meta,
+                processor: recoveredProcessor,
+                verifyTimeoutMs: Math.min(
+                  leaseMs,
+                  (recoveredInvoice.ttl ?? leaseMs / 1000) * 1000,
+                ),
+              }
+            : await resolveAndInitiatePayment({
+                message,
+                priced,
+                requestEventId: admission.requestEventId,
+                clientPubkey: ctx.clientPubkey,
+                clientPmis: ctx.clientPmis,
+                options,
+                processorsByPmi,
+                context: { abortSignal, deadlineMs: record.leaseExpiresAtMs },
+                beforeInvoice: async () => {
+                  if (abortSignal?.aborted) return false;
+                  const owned = await store.transition({
+                    ...fence,
+                    type: 'issuing',
+                  });
+                  return owned && !abortSignal?.aborted;
+                },
+              });
         if (initiated.kind === 'superseded') {
           await store.transition({ ...fence, type: 'release' });
           return;
@@ -171,6 +205,7 @@ export function createServerPaymentsMiddleware(params: {
           initiated;
         const pollingTimeoutMs = Math.min(verifyTimeoutMs, leaseMs);
         if (
+          !recovering &&
           !(await store.transition({
             ...fence,
             type: 'bind',
@@ -185,28 +220,52 @@ export function createServerPaymentsMiddleware(params: {
           snapshotTtlMs: leaseMs + 60_000,
         });
         if (abortSignal?.aborted) return;
-        await sender.sendNotification(
-          ctx.clientPubkey,
-          {
-            jsonrpc: '2.0',
-            method: PAYMENT_REQUIRED_METHOD,
-            params: { ...paymentRequired, _meta: mergedMeta },
-          },
-          admission.requestEventId,
-        );
-        const verified = await verifyPaymentUnlessShutdown({
-          processor,
-          verifyParams: {
-            pay_req: paymentRequired.pay_req,
-            requestEventId: admission.requestEventId,
-            clientPubkey: ctx.clientPubkey,
-          },
-          timeoutMs: pollingTimeoutMs,
-          shutdownSignal: abortSignal,
-        });
+        if (
+          !record.settlement &&
+          (record.invoiceExpiresAtMs === undefined ||
+            record.invoiceExpiresAtMs > Date.now())
+        )
+          await sender.sendNotification(
+            ctx.clientPubkey,
+            {
+              jsonrpc: '2.0',
+              method: PAYMENT_REQUIRED_METHOD,
+              params: {
+                ...paymentRequired,
+                ...(recovering &&
+                  record.invoiceExpiresAtMs !== undefined && {
+                    ttl: Math.max(
+                      0.001,
+                      (record.invoiceExpiresAtMs - Date.now()) / 1000,
+                    ),
+                  }),
+                _meta: mergedMeta,
+              },
+            },
+            admission.requestEventId,
+          );
+        if (!record.settlement)
+          await store.transition({ ...fence, type: 'offer_published' });
+        const verified = record.settlement
+          ? {}
+          : await verifyPaymentUnlessShutdown({
+              processor,
+              verifyParams: {
+                pay_req: paymentRequired.pay_req,
+                requestEventId: admission.requestEventId,
+                clientPubkey: ctx.clientPubkey,
+              },
+              timeoutMs: pollingTimeoutMs,
+              shutdownSignal: abortSignal,
+            });
         if (
           !verified ||
           abortSignal?.aborted ||
+          !(await store.transition({
+            ...fence,
+            type: 'settled',
+            ttlMs: leaseMs,
+          })) ||
           !(await store.transition({ ...fence, type: 'consume' }))
         )
           return;

@@ -1,8 +1,12 @@
+import { reconcilePaymentAttempt } from './payment-recovery.js';
 import type { JSONRPCErrorResponse } from '@contextvm/mcp-sdk/types.js';
 import type { ServerMiddlewareFn, PaymentProcessor } from './types.js';
 import { isJsonRpcRequest } from './types.js';
 import type { ServerPaymentsOptions } from './server-payments.js';
-import type { PaymentStateStore } from './payment-state-store.js';
+import type {
+  PaymentStateStore,
+  PaymentStateRecord,
+} from './payment-state-store.js';
 import { paymentEventKey } from './payment-state-store.js';
 import {
   buildProcessorsByPmi,
@@ -34,6 +38,9 @@ export interface ExplicitGatingMiddlewareParams {
     requestEventId: string,
   ) => Promise<void>;
   processorsByPmi?: Map<string, PaymentProcessor>;
+  onPaidDuplicate?: (record: PaymentStateRecord) => Promise<void>;
+  onPaymentPending?: (requestEventId: string) => void;
+  onInvoiceIssued?: (params: { requestEventId: string }) => void;
   abortSignal?: AbortSignal;
 }
 
@@ -87,8 +94,10 @@ export function createExplicitGatingMiddleware(
         admission.requestEventId,
       );
     };
+    params.onPaymentPending?.(admission.requestEventId);
     const admitted = await store.admit(admission);
     if (admitted.status === 'claimed') {
+      params.onInvoiceIssued?.({ requestEventId: admission.requestEventId });
       if (!abortSignal?.aborted) {
         await forward(message);
         await store.transition({
@@ -99,7 +108,53 @@ export function createExplicitGatingMiddleware(
       }
       return;
     }
-    if (admitted.status === 'duplicate') return;
+    if (admitted.status === 'duplicate') {
+      if (admitted.record?.delivery)
+        await params.onPaidDuplicate?.(admitted.record);
+      return;
+    }
+    if (
+      (admitted.status === 'unknown' ||
+        (admitted.status === 'pending' &&
+          admitted.record?.offerStatus !== 'published')) &&
+      admitted.record?.invoice
+    ) {
+      const record = admitted.record;
+      if (
+        record.offerStatus !== 'published' &&
+        (record.invoiceExpiresAtMs ?? 0) > Date.now()
+      ) {
+        await respond(PAYMENT_REQUIRED_ERROR_CODE, 'Payment Required', {
+          payment_options: [
+            {
+              ...record.invoice,
+              ttl: Math.min(
+                record.invoice?.ttl ?? Infinity,
+                ((record.invoiceExpiresAtMs ?? Date.now()) - Date.now()) / 1000,
+              ),
+            },
+          ],
+          instructions: 'Resume the existing payment; do not pay it again.',
+        });
+      } else {
+        await respond(
+          PAYMENT_PENDING_ERROR_CODE,
+          'Settlement reconciliation required',
+          { retry_after: 2, reason: 'payment_reconciliation_required' },
+        );
+      }
+      void reconcilePaymentAttempt({
+        store,
+        key: record.key,
+        generation: record.generation,
+        processors: options.processors,
+        authorizationTtlMs: options.authorizationTtlMs ?? leaseMs,
+        abortSignal,
+        deadlineMs: Date.now() + leaseMs,
+        outcomes: options,
+      }).catch(() => {});
+      return;
+    }
     if (admitted.status === 'pending') {
       await respond(PAYMENT_PENDING_ERROR_CODE, 'Payment Pending', {
         retry_after: 2,
@@ -183,6 +238,7 @@ export function createExplicitGatingMiddleware(
           'Pay one option, then retry with the same method and semantic params.',
         payment_options: [{ ...paymentRequired, _meta: mergedMeta }],
       });
+      await store.transition({ ...fence, type: 'offer_published' });
       void (async (): Promise<void> => {
         const verified = await verifyPaymentUnlessShutdown({
           processor,
@@ -195,17 +251,25 @@ export function createExplicitGatingMiddleware(
           shutdownSignal: abortSignal,
         });
         if (!verified || abortSignal?.aborted) {
-          await store.transition({ ...fence, type: 'expire' });
+          await store.transition({
+            ...fence,
+            type: 'uncertain',
+            reason: 'verification_incomplete',
+          });
           return;
         }
         await store.transition({
           ...fence,
-          type: 'grant',
+          type: 'settled',
           ttlMs: options.authorizationTtlMs ?? leaseMs,
         });
       })().catch(async () => {
         try {
-          await store.transition({ ...fence, type: 'expire' });
+          await store.transition({
+            ...fence,
+            type: 'uncertain',
+            reason: 'verification_incomplete',
+          });
         } catch {
           logger.error('Payment verification state could not be persisted', {
             requestEventId: admission.requestEventId,

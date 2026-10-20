@@ -329,7 +329,7 @@ describe('Explicit Gating Middleware', () => {
     expect(sentResponses[2].error.code).toBe(PAYMENT_REQUIRED_ERROR_CODE);
   });
 
-  test('clears pending and returns fresh -32042 when verifyPayment rejects', async () => {
+  test('retains an uncertain invoice for reconciliation when verifyPayment rejects', async () => {
     const store = new AuthorizationStore();
     const sentResponses: JSONRPCErrorResponse[] = [];
     let createCount = 0;
@@ -370,15 +370,15 @@ describe('Explicit Gating Middleware', () => {
     // Let the async verifyPayment reject and clear pending state.
     await new Promise((r) => setTimeout(r, 5));
 
-    // Retry: fresh -32042 (not -32043) with a brand-new payment request.
+    // Retry must reconcile the existing invoice without requesting another payment.
     await mw(message, ctx, async () => {});
     expect(sentResponses).toHaveLength(2);
-    expect(sentResponses[1].error.code).toBe(PAYMENT_REQUIRED_ERROR_CODE);
-    expect(createCount).toBe(2);
+    expect(sentResponses[1].error.code).toBe(PAYMENT_PENDING_ERROR_CODE);
+    expect(createCount).toBe(1);
   });
 
   // Timeout-path counterpart to the test above.
-  test('clears pending and returns fresh -32042 when verifyPayment times out', async () => {
+  test('retains an uncertain invoice for reconciliation when verifyPayment times out', async () => {
     const store = new AuthorizationStore();
     const sentResponses: JSONRPCErrorResponse[] = [];
     let createCount = 0;
@@ -423,11 +423,11 @@ describe('Explicit Gating Middleware', () => {
     // Wait for the verify timeout (~200ms) + clearPending.
     await new Promise((r) => setTimeout(r, 300));
 
-    // Retry: fresh -32042 (not -32043).
+    // Retry must reconcile the existing invoice without requesting another payment.
     await mw(message, ctx, async () => {});
     expect(sentResponses).toHaveLength(2);
-    expect(sentResponses[1].error.code).toBe(PAYMENT_REQUIRED_ERROR_CODE);
-    expect(createCount).toBe(2);
+    expect(sentResponses[1].error.code).toBe(PAYMENT_PENDING_ERROR_CODE);
+    expect(createCount).toBe(1);
   });
 
   // --- CEP-8 explicit-gating security invariants ---

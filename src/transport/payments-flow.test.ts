@@ -905,16 +905,14 @@ describe.serial('payments fake flow (transport-level)', () => {
     };
 
     const startedAt = Date.now();
-    await expect(mw(message, ctx, forward)).rejects.toThrow(
-      /verifyPayment timed out/,
-    );
+    await expect(mw(message, ctx, forward)).rejects.toThrow(/timed out/);
     const elapsed = Date.now() - startedAt;
     expect(elapsed).toBeGreaterThanOrEqual(900);
     expect(elapsed).toBeLessThan(3000);
     expect(forwarded).toBe(0);
 
     // The same admitted event cannot create a second payment after its lease expires.
-    await mw(message, ctx, forward);
+    await expect(mw(message, ctx, forward)).rejects.toThrow(/timed out/);
     expect(invoices).toBe(1);
     expect(forwarded).toBe(0);
   }, 20000);
@@ -1473,7 +1471,7 @@ describe.serial('payments fake flow (transport-level)', () => {
   // (distinct pay_req). The client pays twice; the tool runs exactly once.
   // Locks wire-level correlation across the verify-failure branch (the double-
   // charge window documented on onPaymentRequired).
-  test('explicit gating: verifyPayment failure yields a fresh invoice on retry', async () => {
+  test('explicit gating: verifyPayment failure reconciles the existing invoice on retry', async () => {
     const serverSK = generateSecretKey();
     const serverPrivateKey = bytesToHex(serverSK);
     const serverPublicKey = getPublicKey(serverSK);
@@ -1549,7 +1547,7 @@ describe.serial('payments fake flow (transport-level)', () => {
       serverPubkey: serverPublicKey,
       encryptionMode: EncryptionMode.DISABLED,
     });
-    // Client pays unconditionally, so both invoices get paid.
+    // The existing invoice identity prevents a second approval while reconciliation runs.
     const paidClientTransport = withClientPayments(clientTransport, {
       handlers: [],
       paymentInteraction: 'explicit_gating',
@@ -1573,9 +1571,8 @@ describe.serial('payments fake flow (transport-level)', () => {
     };
     expect(typedResult.content[0]).toMatchObject({ type: 'text', text: '12' });
 
-    // Two distinct invoices issued; verify ran twice; the tool ran exactly once.
-    expect(issuedPayReqs).toHaveLength(2);
-    expect(issuedPayReqs[0]).not.toBe(issuedPayReqs[1]);
+    // One invoice; receiver lookup recovers settlement and the handler runs once.
+    expect(issuedPayReqs).toHaveLength(1);
     expect(verifyCount).toBe(2);
     expect(toolCallCount).toBe(1);
 

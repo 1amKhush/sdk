@@ -44,8 +44,7 @@ test('clock rollback cannot readmit a collected event', async () => {
   const admitted = await store.admit(input);
   expect(admitted.status).toBe('reserved');
   const generation = admitted.record!.generation;
-  await store.transition({ key: input.key, generation, type: 'consume' });
-  await store.transition({ key: input.key, generation, type: 'dispatch' });
+  await store.transition({ key: input.key, generation, type: 'reject' });
   now += 1001;
   expect((await store.admit(input)).status).toBe('stale');
   expect(await store.read(input.key)).toBeUndefined();

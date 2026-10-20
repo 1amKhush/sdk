@@ -240,7 +240,7 @@ describe('withServerPayments shutdown cancels in-flight verification', () => {
     }
   }, 20_000);
 
-  test('explicit gating: close() aborts the verify signal and a late settle clears pending instead of granting', async () => {
+  test('explicit gating: close() aborts the verify signal and a late settle retains an uncertain attempt instead of granting', async () => {
     const stateStore = new InMemoryPaymentStateStore();
     const transitionSpy = spyOn(stateStore, 'transition');
     const { processor, verifyStarted, settle } = createControlledProcessor({
@@ -276,7 +276,9 @@ describe('withServerPayments shutdown cancels in-flight verification', () => {
         transitionSpy.mock.calls.filter(([change]) => change.type === 'grant'),
       ).toHaveLength(0);
       expect(
-        transitionSpy.mock.calls.some(([change]) => change.type === 'expire'),
+        transitionSpy.mock.calls.some(
+          ([change]) => change.type === 'uncertain',
+        ),
       ).toBe(true);
       expect(toolCalls).toHaveLength(0);
     } finally {

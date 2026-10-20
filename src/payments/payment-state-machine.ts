@@ -1,3 +1,4 @@
+import { canonicalJson } from '../core/utils/canonical-json.js';
 import type {
   PaymentStateAdmission,
   PaymentStateAdmissionResult,
@@ -45,7 +46,13 @@ export function canCollectPaymentRecord(
   return (
     record.retainUntilMs !== null &&
     record.retainUntilMs <= now &&
-    !isLivePaymentLease(record, now)
+    !isLivePaymentLease(record, now) &&
+    !(
+      (record.invoice && !record.settlement) ||
+      (record.invoice &&
+        ['consumed', 'dispatched'].includes(record.phase) &&
+        record.delivery?.status !== 'published')
+    )
   );
 }
 
@@ -99,7 +106,7 @@ export function admitPaymentState(
       event.createdAt * 1000 > now + policy.maxFutureSkewMs)
   )
     return done('stale');
-  if (view.execution) return done('duplicate');
+  if (view.execution) return done('duplicate', view.execution);
   const eventDeadline = event
     ? event.createdAt * 1000 + policy.replayWindowMs
     : null;
@@ -111,6 +118,12 @@ export function admitPaymentState(
     )
       return done('unknown');
     if (input.mode === 'transparent') return done('duplicate');
+    if (
+      current.invoice &&
+      ['pending', 'expired'].includes(current.phase) &&
+      current.leaseExpiresAtMs <= now
+    )
+      return done('unknown');
     if (
       current.phase === 'unknown' ||
       (current.phase === 'issuing' && current.leaseExpiresAtMs <= now)
@@ -130,10 +143,7 @@ export function admitPaymentState(
         phase: 'consumed',
         eventIds,
         replayExpiresAtMs,
-        retainUntilMs:
-          replayExpiresAtMs === null
-            ? null
-            : Math.max(replayExpiresAtMs, current.invoiceExpiresAtMs ?? 0),
+        retainUntilMs: null,
       };
       const execution: PaymentStateRecord = {
         ...consumed,
@@ -224,7 +234,7 @@ export function transitionPaymentState(
   input: PaymentStateTransition,
   current: PaymentStateRecord | undefined,
   now: number,
-  policy: PaymentStatePolicy,
+  _policy: PaymentStatePolicy,
 ): PaymentStateChange<boolean> {
   const none: PaymentStateChange<boolean> = {
     result: false,
@@ -238,7 +248,7 @@ export function transitionPaymentState(
     case 'issuing':
       if (record.phase !== 'reserved' || !live) return none;
       record.phase = 'issuing';
-      if (record.mode === 'explicit_gating') record.retainUntilMs = null;
+      record.retainUntilMs = null;
       break;
     case 'bind':
       if (record.phase !== 'issuing') return none;
@@ -273,7 +283,7 @@ export function transitionPaymentState(
       );
       if (!live) {
         record.phase = 'unknown';
-        if (record.mode === 'explicit_gating') record.retainUntilMs = null;
+        record.retainUntilMs = null;
         return { ...none, put: [record] };
       }
       record.phase = 'pending';
@@ -282,16 +292,7 @@ export function transitionPaymentState(
         now + Math.floor(input.leaseMs),
         record.invoiceExpiresAtMs,
       );
-      record.retainUntilMs =
-        record.replayExpiresAtMs === null
-          ? null
-          : Math.max(
-              record.replayExpiresAtMs,
-              record.invoiceExpiresAtMs,
-              record.mode === 'explicit_gating'
-                ? now + policy.replayWindowMs
-                : 0,
-            );
+      record.retainUntilMs = null;
       break;
     case 'grant':
       if (
@@ -307,24 +308,167 @@ export function transitionPaymentState(
       )
         throw new TypeError('Invalid authorization TTL');
       record.phase = 'granted';
+      record.settlement = { verifiedAtMs: now };
       record.grantExpiresAtMs = now + Math.floor(input.ttlMs);
       record.retainUntilMs = null;
       break;
     case 'consume':
       if (!['pending', 'reserved'].includes(record.phase) || !live) return none;
       record.phase = 'consumed';
+      record.retainUntilMs = record.invoice ? null : record.replayExpiresAtMs;
       if (record.mode === 'explicit_gating') {
         record.key = paymentEventKey(
           record.clientPubkey,
           record.requestEventId,
         );
-        record.retainUntilMs = record.replayExpiresAtMs;
+        record.retainUntilMs = record.invoice ? null : record.replayExpiresAtMs;
         return { result: true, put: [record], remove: [current.key] };
       }
       break;
     case 'dispatch':
       if (record.phase !== 'consumed') return none;
       record.phase = 'dispatched';
+      break;
+    case 'offer_published':
+      if (
+        !record.invoice ||
+        !['pending', 'unknown', 'expired'].includes(record.phase)
+      )
+        return none;
+      record.offerStatus = 'published';
+      break;
+    case 'reconciliation_claim':
+      if (
+        !record.invoice ||
+        record.settlement ||
+        !['pending', 'expired', 'unknown'].includes(record.phase) ||
+        (record.reconciliation && record.reconciliation.leaseExpiresAtMs > now)
+      )
+        return none;
+      if (
+        !input.owner ||
+        !Number.isSafeInteger(input.leaseMs) ||
+        input.leaseMs < 1 ||
+        input.leaseMs > 2_147_483_647
+      )
+        throw new TypeError('Invalid reconciliation lease');
+      record.reconciliation = {
+        owner: input.owner,
+        leaseExpiresAtMs: now + input.leaseMs,
+      };
+      record.retainUntilMs = null;
+      break;
+    case 'reconciliation_release':
+      if (record.reconciliation?.owner !== input.owner) return none;
+      delete record.reconciliation;
+      break;
+    case 'settled':
+      if (
+        input.owner &&
+        (record.reconciliation?.owner !== input.owner ||
+          record.reconciliation.leaseExpiresAtMs <= now)
+      )
+        return none;
+      if (
+        !record.invoice ||
+        !['pending', 'expired', 'unknown'].includes(record.phase)
+      )
+        return none;
+      if (
+        !Number.isSafeInteger(input.ttlMs) ||
+        input.ttlMs < 1 ||
+        input.ttlMs > 2_147_483_647
+      )
+        throw new TypeError('Invalid recovery authorization TTL');
+      record.settlement = { verifiedAtMs: now };
+      delete record.reconciliation;
+      record.retainUntilMs = null;
+      if (record.mode === 'explicit_gating') {
+        record.phase = 'granted';
+        record.grantExpiresAtMs = now + input.ttlMs;
+      } else {
+        // A reconciler recognizes money but never executes an application handler.
+        record.phase = 'pending';
+        record.leaseExpiresAtMs = now + input.ttlMs;
+      }
+      break;
+    case 'result':
+      if (!['consumed', 'dispatched'].includes(record.phase)) return none;
+      if (record.delivery)
+        return canonicalJson(record.delivery.response) ===
+          canonicalJson(input.delivery.response)
+          ? { result: true, put: [], remove: [] }
+          : none;
+      record.delivery = JSON.parse(
+        JSON.stringify(input.delivery),
+      ) as typeof input.delivery;
+      record.retainUntilMs = null;
+      break;
+    case 'publication_claim':
+      if (
+        !record.delivery ||
+        record.delivery.status === 'published' ||
+        (record.delivery.owner && (record.delivery.leaseExpiresAtMs ?? 0) > now)
+      )
+        return none;
+      if (
+        !input.owner ||
+        !Number.isSafeInteger(input.leaseMs) ||
+        input.leaseMs < 1 ||
+        input.leaseMs > 2_147_483_647
+      )
+        throw new TypeError('Invalid publication lease');
+      record.delivery.owner = input.owner;
+      record.delivery.leaseExpiresAtMs = now + input.leaseMs;
+      break;
+    case 'publication_progress':
+      if (
+        !record.delivery ||
+        record.delivery.owner !== input.owner ||
+        (record.delivery.leaseExpiresAtMs ?? 0) <= now ||
+        record.delivery.status === 'published'
+      )
+        return none;
+      if (
+        !Number.isSafeInteger(input.frames) ||
+        input.frames < record.delivery.acknowledgedFrames ||
+        (input.chunkSizeBytes !== undefined &&
+          (!Number.isSafeInteger(input.chunkSizeBytes) ||
+            input.chunkSizeBytes < 1))
+      )
+        throw new TypeError('Invalid publication progress');
+      if (
+        record.delivery.chunkSizeBytes !== undefined &&
+        input.chunkSizeBytes !== record.delivery.chunkSizeBytes
+      )
+        return none;
+      if (input.leaseMs !== undefined) {
+        if (
+          !Number.isSafeInteger(input.leaseMs) ||
+          input.leaseMs < 1 ||
+          input.leaseMs > 2_147_483_647
+        )
+          throw new TypeError('Invalid publication renewal');
+        record.delivery.leaseExpiresAtMs = now + input.leaseMs;
+      }
+      record.delivery.acknowledgedFrames = input.frames;
+      if (input.chunkSizeBytes !== undefined)
+        record.delivery.chunkSizeBytes = input.chunkSizeBytes;
+      break;
+    case 'published':
+    case 'publication_failed':
+      if (
+        !record.delivery ||
+        record.delivery.owner !== input.owner ||
+        record.delivery.status === 'published'
+      )
+        return none;
+      record.delivery.status =
+        input.type === 'published' ? 'published' : 'unknown';
+      delete record.delivery.owner;
+      delete record.delivery.leaseExpiresAtMs;
+      record.retainUntilMs =
+        input.type === 'published' ? record.replayExpiresAtMs : null;
       break;
     case 'release':
       if (record.phase !== 'reserved') return none;
@@ -342,7 +486,7 @@ export function transitionPaymentState(
       if (!['issuing', 'pending'].includes(record.phase)) return none;
       record.phase = 'unknown';
       record.reason = input.reason;
-      if (record.mode === 'explicit_gating') record.retainUntilMs = null;
+      record.retainUntilMs = null;
       break;
     default:
       throw new TypeError('Unknown payment state transition');

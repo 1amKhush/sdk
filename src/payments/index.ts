@@ -23,3 +23,6 @@ export * from './in-memory-payment-state-store.js';
 export * from './authorization-store.js';
 export * from './canonical-identity.js';
 export * from './payment-cancellation.js';
+export * from './payment-outcomes.js';
+export * from './payment-recovery.js';
+export * from './payment-delivery.js';
