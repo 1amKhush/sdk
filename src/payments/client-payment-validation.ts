@@ -86,6 +86,7 @@ export function validateClientPaymentOptions(
   options: ClientPaymentsOptions,
 ): void {
   const schema = z.object({
+    disposeHandlersOnClose: z.boolean().optional(),
     syntheticProgressIntervalMs: timerSchema.optional(),
     defaultPaymentTtlMs: timerSchema.optional(),
     minRetryDelayMs: z

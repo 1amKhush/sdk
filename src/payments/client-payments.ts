@@ -121,6 +121,21 @@ export function withClientPayments(
   let onmessage: Transport['onmessage'];
   let onerror: Transport['onerror'];
   let onclose: Transport['onclose'];
+  let disposing: Promise<void> | undefined;
+  const disposeHandlers = (): Promise<void> => {
+    disposing ??= options.disposeHandlersOnClose
+      ? Promise.allSettled(
+          [...new Set(options.handlers ?? [])].map((handler) =>
+            Promise.resolve().then(() => handler.dispose?.()),
+          ),
+        ).then((results) => {
+          if (results.some((result) => result.status === 'rejected'))
+            onerror?.(new Error('Payment handler disposal failed'));
+        })
+      : Promise.resolve();
+    return disposing;
+  };
+
   const progress = new ClientPaymentProgress(
     options.syntheticProgressIntervalMs ??
       DEFAULT_SYNTHETIC_PROGRESS_INTERVAL_MS,
@@ -292,6 +307,7 @@ export function withClientPayments(
           JSON.stringify(state.request),
         ) as NonNullable<typeof state.request>,
         abortSignal: state.controller.signal,
+      deadlineMs: state.deadline,
       });
       if (!lifecycle.isActive(state)) return;
       if (result.paid) {
@@ -410,6 +426,7 @@ export function withClientPayments(
       _meta: option._meta,
       requestEventId: eventId,
       abortSignal: state.controller.signal,
+      deadlineMs: state.deadline,
     };
     const decline = (message: string): void => {
       attempt.complete('declined');
@@ -607,6 +624,7 @@ export function withClientPayments(
       transport.onclose = (): void => {
         lifecycle.close();
         progress.clear();
+        void disposeHandlers();
         onclose?.();
       };
       try {
@@ -638,7 +656,7 @@ export function withClientPayments(
     async close(): Promise<void> {
       lifecycle.close();
       progress.clear();
-      await transport.close();
+      try { await transport.close(); } finally { await disposeHandlers(); }
     },
   };
   clientPaymentsWrapped.add(transport);

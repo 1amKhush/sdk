@@ -35,6 +35,8 @@ import { validateServerPaymentOptions } from './server-payment-validation.js';
 /** Server-side payment policy; both lifecycles share one atomic state store. */
 export interface ServerPaymentsOptions extends Partial<PaymentStatePolicy> {
   processors: readonly PaymentProcessor[];
+  /** Dispose configured processors only when exclusively owned by this transport. @default false */
+  disposeProcessorsOnClose?: boolean;
   pricedCapabilities: readonly PricedCapability[];
   /** Optional per-request quote, constrained by the advertised inclusive range. */
   resolvePrice?: ResolvePriceFn;
@@ -138,6 +140,7 @@ export function createServerPaymentsMiddleware(params: {
           clientPmis: ctx.clientPmis,
           options,
           processorsByPmi,
+          context: { abortSignal, deadlineMs: record.leaseExpiresAtMs },
           beforeInvoice: async () => {
             if (abortSignal?.aborted) return false;
             const owned = await store.transition({ ...fence, type: 'issuing' });

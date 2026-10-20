@@ -210,6 +210,8 @@ export class NostrServerTransport
   private readonly inboundMiddlewares: InboundMiddlewareFn[] = [];
   /** Aborted at the top of `close()`; see `closeSignal`. */
   private readonly closeController = new AbortController();
+  private readonly closeHandlers = new Set<() => Promise<void>>();
+  private closing?: Promise<void>;
   private readonly listToolsResultTransformers: ListToolsResultTransformer[] =
     [];
   private readonly listToolsAnnouncementTagsProducers: ListToolsAnnouncementTagsProducer[] =
@@ -588,14 +590,32 @@ export class NostrServerTransport
     }
   }
 
-  /**
-   * Closes the transport, disconnecting from the relay.
-   */
-  public async close(): Promise<void> {
+  /** Registers cleanup for resources explicitly owned by a transport integration. */
+  public addCloseHandler(handler: () => Promise<void>): void {
+    if (this.closeSignal.aborted) throw new Error('Transport is closed');
+    this.closeHandlers.add(handler);
+  }
+
+  /** Closes the transport and disposes registered owned resources exactly once. */
+  public close(): Promise<void> {
+    this.closing ??= this.closeInternal();
+    return this.closing;
+  }
+
+  private async closeInternal(): Promise<void> {
     try {
       // Signal shutdown before any await: a payment verification that settles
       // during teardown must not forward, publish, or grant.
       this.closeController.abort();
+      const cleanup = await Promise.allSettled(
+        [...this.closeHandlers].map((handler) =>
+          Promise.resolve().then(handler),
+        ),
+      );
+      this.closeHandlers.clear();
+      for (const result of cleanup)
+        if (result.status === 'rejected')
+          this.onerror?.(new Error('Integration cleanup failed'));
 
       // Shutdown the task queue to prevent new tasks from being queued
       // and clear pending tasks to avoid operating on stale state

@@ -1,5 +1,13 @@
+import {
+  paymentOperation,
+  type PaymentFetch,
+} from '../payment-cancellation.js';
 import { kinds, type Filter, type NostrEvent } from 'nostr-tools';
-import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
+import {
+  finalizeEvent,
+  generateSecretKey,
+  verifyEvent,
+} from 'nostr-tools/pure';
 import type { RelayHandler } from '../../core/interfaces.js';
 import { ApplesauceRelayPool } from '../../relay/applesauce-relay-pool.js';
 import { createLogger, type Logger } from '../../core/utils/logger.js';
@@ -19,6 +27,8 @@ import type {
 export interface LnBolt11ZapPaymentProcessorOptions {
   /** Lightning address (LUD-16), e.g. `alice@example.com`. */
   lnAddress: string;
+  /** Optional HTTP implementation for custom runtimes and fault injection. */
+  fetch?: PaymentFetch;
 
   /** Optional relay handler to reuse; otherwise a new ApplesauceRelayPool is created. */
   relayHandler?: RelayHandler;
@@ -28,7 +38,7 @@ export interface LnBolt11ZapPaymentProcessorOptions {
   /** Time-to-live in seconds returned in `payment_required`. @default 300 */
   ttlSeconds?: number;
 
-  /** Maximum number of in-flight invoice verifications to dedupe. @default 5000 */
+  /** Maximum concurrent independently cancellable receipt waiters. @default 5000 */
   maxInFlightVerifications?: number;
   /** Maximum number of pending invoice issuances to remember. @default 10000 */
   maxPendingInvoices?: number;
@@ -59,6 +69,9 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
     'wss://nos.lol',
   ];
 
+  private readonly shutdown = new AbortController();
+  private readonly ownsRelayHandler: boolean;
+  private readonly fetch: PaymentFetch;
   private readonly lnAddress: string;
   private readonly relayHandler: RelayHandler;
   private readonly relayUrls: string[];
@@ -66,13 +79,14 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
   private readonly logger: Logger;
 
   private readonly signerSecretKey: Uint8Array;
-  private readonly inFlightVerifications: LruCache<
-    Promise<{ _meta?: Record<string, unknown> }>
-  >;
+  private activeVerifications = 0;
+  private readonly maxInFlightVerifications: number;
   private readonly pendingInvoices: LruCache<PendingInvoiceMeta>;
 
   public constructor(options: LnBolt11ZapPaymentProcessorOptions) {
+    this.fetch = options.fetch ?? globalThis.fetch;
     this.lnAddress = options.lnAddress;
+    this.ownsRelayHandler = !options.relayHandler;
     this.relayUrls =
       options.relayUrls ??
       options.relayHandler?.getRelayUrls?.() ??
@@ -85,15 +99,37 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
 
     this.signerSecretKey = generateSecretKey();
 
-    this.inFlightVerifications = new LruCache(
-      options.maxInFlightVerifications ?? 5000,
-    );
+    this.maxInFlightVerifications = options.maxInFlightVerifications ?? 5000;
     this.pendingInvoices = new LruCache(options.maxPendingInvoices ?? 10000);
   }
 
+  /** Cancels adapter work; disconnects only the internally created relay pool. */
+  public async dispose(): Promise<void> {
+    if (this.shutdown.signal.aborted) return;
+    this.shutdown.abort();
+    if (this.ownsRelayHandler) await this.relayHandler.disconnect();
+  }
+
+  /** Creates a zap invoice with bounded, cancellable HTTP work. */
   public async createPaymentRequired(
     params: PaymentProcessorCreateParams,
-  ): Promise<{
+  ): Promise<import('../types.js').PaymentRequired> {
+    const operation = paymentOperation(
+      params,
+      this.ttlSeconds * 1000,
+      this.shutdown.signal,
+    );
+    try {
+      operation.signal.throwIfAborted();
+      return await operation.wait(
+        this.createInternal({ ...params, abortSignal: operation.signal }),
+      );
+    } finally {
+      operation.dispose();
+    }
+  }
+
+  private async createInternal(params: PaymentProcessorCreateParams): Promise<{
     amount: number;
     pay_req: string;
     description?: string;
@@ -113,7 +149,11 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
       amountSats: params.amount,
     });
 
-    const payParams = await fetchLnurlPayParams({ lnAddress: this.lnAddress });
+    const payParams = await fetchLnurlPayParams({
+      lnAddress: this.lnAddress,
+      abortSignal: params.abortSignal,
+      fetch: this.fetch,
+    });
 
     if (!payParams.allowsNostr || !payParams.nostrPubkey) {
       throw new Error('LNURL-pay endpoint does not support NIP-57 zaps');
@@ -146,6 +186,8 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
     );
 
     const { pr } = await requestZapInvoice({
+      abortSignal: params.abortSignal,
+      fetch: this.fetch,
       callback: payParams.callback,
       amountMsats,
       zapRequestJson: JSON.stringify(zapRequest),
@@ -172,14 +214,27 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
   public async verifyPayment(
     params: PaymentProcessorVerifyParams,
   ): Promise<{ _meta?: Record<string, unknown> }> {
-    const existing = this.inFlightVerifications.get(params.pay_req);
-    if (existing) return await existing;
-
-    const run = this.verifyPaymentInternal(params).finally(() => {
-      this.inFlightVerifications.delete(params.pay_req);
-    });
-    this.inFlightVerifications.set(params.pay_req, run);
-    return await run;
+    // Each waiter owns its signal and subscription; aborting one cannot cancel a peer.
+    if (this.activeVerifications >= this.maxInFlightVerifications)
+      throw new Error('Zap verification capacity reached');
+    this.activeVerifications++;
+    const operation = paymentOperation(
+      params,
+      this.ttlSeconds * 1000,
+      this.shutdown.signal,
+    );
+    try {
+      operation.signal.throwIfAborted();
+      return await operation.wait(
+        this.verifyPaymentInternal({
+          ...params,
+          abortSignal: operation.signal,
+        }),
+      );
+    } finally {
+      operation.dispose();
+      this.activeVerifications--;
+    }
   }
 
   private async verifyPaymentInternal(
@@ -196,13 +251,15 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
       // Stateless fallback: re-fetch pay params to get the expected zapper pubkey.
       const payParams = await fetchLnurlPayParams({
         lnAddress: this.lnAddress,
+        abortSignal: params.abortSignal,
+        fetch: this.fetch,
       });
       if (!payParams.nostrPubkey) {
         throw new Error('Cannot verify zap receipt: missing lnurl nostrPubkey');
       }
       this.pendingInvoices.set(params.pay_req, {
         expectedZapperPubkey: payParams.nostrPubkey,
-        since: Math.floor(Date.now() / 1000) - this.ttlSeconds,
+        since: 0,
         amountMsats: NaN,
       });
     }
@@ -249,8 +306,19 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
 
       params.abortSignal?.addEventListener('abort', onAbort, { once: true });
 
+      if (params.abortSignal?.aborted) {
+        onAbort();
+        return;
+      }
       void this.relayHandler
         .subscribe([filter], (event) => {
+          if (
+            settled ||
+            event.pubkey !== meta.expectedZapperPubkey ||
+            event.kind !== kinds.Zap ||
+            !verifyEvent(event)
+          )
+            return;
           try {
             const bolt11 = getBolt11FromZapReceipt(event);
             if (bolt11 !== params.pay_req) return;

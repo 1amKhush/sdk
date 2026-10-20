@@ -37,6 +37,8 @@ export interface ClientPaymentsOptions {
    * the payment settles out-of-band, and the server's TTL is the timeout.
    */
   handlers?: readonly PaymentHandler[];
+  /** Dispose exclusively owned handlers when this wrapper closes. Shared handlers remain caller-owned by default. */
+  disposeHandlersOnClose?: boolean;
   /** Optional limits across all automatic payment offers for one invocation. */
   limits?: ClientPaymentLimits;
   /**
@@ -134,5 +136,7 @@ export interface ClientPaymentsOptions {
     originalRequest: JSONRPCRequest;
     /** Aborted on completion, cancellation, deadline, or close. Check before paying. */
     abortSignal: AbortSignal;
+    /** Absolute invocation payment deadline, when configured. */
+    deadlineMs?: number;
   }) => Promise<{ paid: boolean; reason?: string }>;
 }

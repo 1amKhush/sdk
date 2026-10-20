@@ -1,6 +1,9 @@
+import {
+  paymentOperation,
+  type PaymentOperationContext,
+} from './payment-cancellation.js';
 import type { JSONRPCRequest } from '@contextvm/mcp-sdk/types.js';
 import { type Logger } from '../core/utils/logger.js';
-import { withTimeout } from '../core/utils/utils.js';
 import {
   validateProcessorPayment,
   validateServerQuote,
@@ -165,6 +168,7 @@ export async function resolveAndInitiatePayment(params: {
     }) => Promise<ResolvePriceResult>;
   };
   processorsByPmi: Map<string, PaymentProcessor>;
+  context?: PaymentOperationContext;
   /** Persists invoice-creation ownership immediately before provider I/O. */
   beforeInvoice?: () => Promise<boolean>;
 }): Promise<InitiationResult> {
@@ -207,16 +211,27 @@ export async function resolveAndInitiatePayment(params: {
     );
   if (params.beforeInvoice && !(await params.beforeInvoice()))
     return { kind: 'superseded' };
-  const paymentRequired = validateProcessorPayment(
-    await processor.createPaymentRequired({
-      amount: resolvedQuote.amount,
-      description: resolvedQuote.description,
-      requestEventId: params.requestEventId,
-      clientPubkey: params.clientPubkey,
-    }),
-    processor,
-    resolvedQuote.amount,
-  );
+  const operation = paymentOperation(params.context, 5 * 60 * 1000);
+  let paymentRequired: PaymentRequired;
+  try {
+    operation.signal.throwIfAborted();
+    paymentRequired = validateProcessorPayment(
+      await operation.wait(
+        processor.createPaymentRequired({
+          amount: resolvedQuote.amount,
+          description: resolvedQuote.description,
+          requestEventId: params.requestEventId,
+          clientPubkey: params.clientPubkey,
+          abortSignal: operation.signal,
+          deadlineMs: params.context?.deadlineMs,
+        }),
+      ),
+      processor,
+      resolvedQuote.amount,
+    );
+  } finally {
+    operation.dispose();
+  }
 
   const mergedMeta =
     resolvedQuote.meta === undefined && paymentRequired._meta === undefined
@@ -272,27 +287,19 @@ export async function verifyPaymentUnlessShutdown(params: {
     return undefined;
   }
 
-  const controller = new AbortController();
-  const onShutdown = (): void => controller.abort();
-  shutdownSignal?.addEventListener('abort', onShutdown, { once: true });
-
+  const operation = paymentOperation({}, params.timeoutMs, shutdownSignal);
   try {
-    const verified = await withTimeout(
+    const verified = await operation.wait(
       params.processor.verifyPayment({
         ...params.verifyParams,
-        abortSignal: controller.signal,
+        abortSignal: operation.signal,
       }),
-      params.timeoutMs,
-      'verifyPayment timed out',
     );
     return shutdownSignal?.aborted ? undefined : verified;
-  } catch (err) {
-    if (shutdownSignal?.aborted) {
-      return undefined;
-    }
-    throw err;
+  } catch (error) {
+    if (shutdownSignal?.aborted) return undefined;
+    throw error;
   } finally {
-    shutdownSignal?.removeEventListener('abort', onShutdown);
-    controller.abort();
+    operation.dispose();
   }
 }

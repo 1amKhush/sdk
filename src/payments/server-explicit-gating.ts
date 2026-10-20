@@ -131,6 +131,7 @@ export function createExplicitGatingMiddleware(
         clientPmis: ctx.clientPmis,
         options,
         processorsByPmi,
+        context: { abortSignal, deadlineMs: record.leaseExpiresAtMs },
         beforeInvoice: async () => {
           if (abortSignal?.aborted) return false;
           const owned = await store.transition({ ...fence, type: 'issuing' });

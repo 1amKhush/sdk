@@ -1,3 +1,7 @@
+import {
+  paymentOperation,
+  type PaymentFetch,
+} from '../payment-cancellation.js';
 import type {
   PaymentProcessor,
   PaymentProcessorCreateParams,
@@ -11,6 +15,8 @@ import { encodeBase64 } from '../../core/utils/base64.js';
 export interface LnBolt11LnbitsPaymentProcessorOptions {
   /** LNbits instance base URL (e.g. `https://lnbits.example.com`). */
   lnbitsUrl: string;
+  /** Optional HTTP implementation for custom runtimes and fault injection. */
+  fetch?: PaymentFetch;
   /** LNbits wallet invoice/read key. */
   lnbitsApiKey: string;
   /** Optional HTTP Basic Auth credentials (`user:password`) for proxied instances. */
@@ -35,6 +41,8 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
   public readonly currencyUnit = 'sats';
   public readonly pmi = PMI_BITCOIN_LIGHTNING_BOLT11;
 
+  private readonly shutdown = new AbortController();
+  private readonly fetch: PaymentFetch;
   private readonly lnbitsUrl: string;
   private readonly lnbitsApiKey: string;
   private readonly lnbitsBasicAuth?: string;
@@ -44,6 +52,7 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
   private readonly logger: Logger;
 
   public constructor(options: LnBolt11LnbitsPaymentProcessorOptions) {
+    this.fetch = options.fetch ?? globalThis.fetch;
     this.lnbitsUrl = options.lnbitsUrl.replace(/\/+$/, '');
     this.lnbitsApiKey = options.lnbitsApiKey;
     this.lnbitsBasicAuth = options.lnbitsBasicAuth;
@@ -65,9 +74,31 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
     return headers;
   }
 
+  /** Cancels work owned by this adapter. */
+  public async dispose(): Promise<void> {
+    this.shutdown.abort();
+  }
+
+  /** Creates an invoice under the supplied cancellation/deadline context. */
   public async createPaymentRequired(
     params: PaymentProcessorCreateParams,
-  ): Promise<{
+  ): Promise<import('../types.js').PaymentRequired> {
+    const operation = paymentOperation(
+      params,
+      this.ttlSeconds * 1000,
+      this.shutdown.signal,
+    );
+    try {
+      operation.signal.throwIfAborted();
+      return await operation.wait(
+        this.createInternal({ ...params, abortSignal: operation.signal }),
+      );
+    } finally {
+      operation.dispose();
+    }
+  }
+
+  private async createInternal(params: PaymentProcessorCreateParams): Promise<{
     amount: number;
     pay_req: string;
     description?: string;
@@ -83,17 +114,15 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
       expiry: this.invoiceExpirySeconds,
     });
 
-    const response = await fetch(`${this.lnbitsUrl}/api/v1/payments`, {
+    const response = await this.fetch(`${this.lnbitsUrl}/api/v1/payments`, {
       method: 'POST',
       headers: this.buildHeaders(),
       body,
+      signal: params.abortSignal,
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(
-        `LNbits create invoice failed: ${response.status} ${text}`,
-      );
+      throw new Error(`LNbits create invoice failed: ${response.status}`);
     }
 
     const result = (await response.json()) as {
@@ -120,24 +149,47 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
     };
   }
 
+  /** Authenticated receiver-side status lookup; does not pay or create invoices. */
   public async verifyPayment(
+    params: PaymentProcessorVerifyParams,
+  ): Promise<{ _meta?: Record<string, unknown> }> {
+    const operation = paymentOperation(
+      params,
+      this.ttlSeconds * 1000,
+      this.shutdown.signal,
+    );
+    try {
+      operation.signal.throwIfAborted();
+      return await operation.wait(
+        this.verifyInternal({ ...params, abortSignal: operation.signal }),
+      );
+    } finally {
+      operation.dispose();
+    }
+  }
+
+  private async verifyInternal(
     params: PaymentProcessorVerifyParams,
   ): Promise<{ _meta?: Record<string, unknown> }> {
     // We need the payment hash to check status. Derive it from the invoice
     // by first looking it up via the decoded invoice endpoint, or by checking
     // all recent payments. The simplest approach: decode the bolt11 to get the hash.
-    const paymentHash = await this.getPaymentHashFromInvoice(params.pay_req);
+    const paymentHash = await this.getPaymentHashFromInvoice(
+      params.pay_req,
+      params.abortSignal,
+    );
 
     while (true) {
       if (params.abortSignal?.aborted) {
         throw new Error('verifyPayment aborted');
       }
 
-      const response = await fetch(
+      const response = await this.fetch(
         `${this.lnbitsUrl}/api/v1/payments/${paymentHash}`,
         {
           method: 'GET',
           headers: this.buildHeaders(),
+          signal: params.abortSignal,
         },
       );
 
@@ -150,7 +202,7 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
           paid: result.paid,
         });
 
-        if (result.paid) {
+        if (result.paid === true) {
           return { _meta: { payment_hash: paymentHash } };
         }
       } else {
@@ -172,12 +224,19 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
    * LNbits returns the payment_hash when creating an invoice, but verifyPayment
    * only receives pay_req. We decode it via LNbits decode endpoint.
    */
-  private async getPaymentHashFromInvoice(bolt11: string): Promise<string> {
-    const response = await fetch(`${this.lnbitsUrl}/api/v1/payments/decode`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify({ data: bolt11 }),
-    });
+  private async getPaymentHashFromInvoice(
+    bolt11: string,
+    abortSignal?: AbortSignal,
+  ): Promise<string> {
+    const response = await this.fetch(
+      `${this.lnbitsUrl}/api/v1/payments/decode`,
+      {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify({ data: bolt11 }),
+        signal: abortSignal,
+      },
+    );
 
     if (response.ok) {
       const decoded = (await response.json()) as { payment_hash?: string };
@@ -187,11 +246,13 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
     }
 
     // Fallback: search recent payments for matching bolt11
-    const paymentsResponse = await fetch(
+    abortSignal?.throwIfAborted();
+    const paymentsResponse = await this.fetch(
       `${this.lnbitsUrl}/api/v1/payments?limit=50`,
       {
         method: 'GET',
         headers: this.buildHeaders(),
+        signal: abortSignal,
       },
     );
 

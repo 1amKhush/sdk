@@ -73,6 +73,17 @@ export function withServerPayments(
   // middlewares stop polling and skip forward/grant once it fires. Not chained
   // through `onclose`, which consumers may reassign after registration.
   const abortSignal = transport.closeSignal;
+  if (options.disposeProcessorsOnClose) {
+    transport.addCloseHandler(async () => {
+      const results = await Promise.allSettled(
+        [...new Set(options.processors)].map((p) =>
+          Promise.resolve().then(() => p.dispose?.()),
+        ),
+      );
+      if (results.some((result) => result.status === 'rejected'))
+        throw new Error('Payment processor disposal failed');
+    });
+  }
 
   transport.addInboundMiddleware(
     createServerPaymentsMiddleware({

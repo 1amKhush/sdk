@@ -63,6 +63,7 @@ export function validateServerPaymentOptions(
         value.maxAmount === undefined || value.maxAmount >= value.amount,
     );
   const schema = z.object({
+    disposeProcessorsOnClose: z.boolean().optional(),
     processors: z.array(
       z.object({
         pmi: z.string().regex(/^[a-z0-9-]+$/),

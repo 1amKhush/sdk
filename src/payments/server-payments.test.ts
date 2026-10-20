@@ -473,13 +473,13 @@ describe('createServerPaymentsMiddleware transport shutdown', () => {
 
     const run = harness.run('evt1');
     await deferred.started;
-    expect(added).toEqual(['abort']);
-    expect(removed).toEqual([]);
+    expect(added).toEqual(['abort', 'abort']);
+    expect(removed).toEqual(['abort']);
 
     deferred.resolve();
     await run;
 
-    expect(removed).toEqual(['abort']);
+    expect(removed).toEqual(added);
     expect(harness.forwards()).toBe(1);
   });
 

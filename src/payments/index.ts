@@ -22,3 +22,4 @@ export * from './payment-state-store.js';
 export * from './in-memory-payment-state-store.js';
 export * from './authorization-store.js';
 export * from './canonical-identity.js';
+export * from './payment-cancellation.js';

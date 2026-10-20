@@ -1,3 +1,4 @@
+import type { PaymentOperationContext } from './payment-cancellation.js';
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -148,7 +149,7 @@ export type PaymentRejectedNotification = JSONRPCNotification & {
   };
 };
 
-export interface PaymentHandlerRequest {
+export interface PaymentHandlerRequest extends PaymentOperationContext {
   amount: number;
   pay_req: string;
   /** The PMI requested by the server (e.g. "bitcoin-lightning-bolt11"). */
@@ -175,18 +176,21 @@ export interface PaymentHandler {
   /** Optional policy check that can decline handling. */
   canHandle?(req: PaymentHandlerRequest): boolean | Promise<boolean>;
 
+  /** Dispose adapter-owned work; a local abort does not reverse a payment. */
+  dispose?(): Promise<void>;
+
   /** Execute the payment (wallet action). */
   handle(req: PaymentHandlerRequest): Promise<void>;
 }
 
-export interface PaymentProcessorCreateParams {
+export interface PaymentProcessorCreateParams extends PaymentOperationContext {
   amount: number;
   description?: string;
   requestEventId: string;
   clientPubkey: string;
 }
 
-export interface PaymentProcessorVerifyParams {
+export interface PaymentProcessorVerifyParams extends PaymentOperationContext {
   pay_req: string;
   requestEventId: string;
   clientPubkey: string;
@@ -315,6 +319,9 @@ export interface PaymentProcessor {
   createPaymentRequired(
     params: PaymentProcessorCreateParams,
   ): Promise<PaymentRequired>;
+
+  /** Dispose adapter-owned work; caller-owned connections remain usable. */
+  dispose?(): Promise<void>;
 
   /** Wait for and/or verify settlement for a previously issued pay_req */
   verifyPayment(
