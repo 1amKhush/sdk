@@ -5,10 +5,17 @@ import {
   paymentEventKey,
 } from '../payments/payment-state-store.js';
 
+function report(value: unknown): void {
+  if (process.send) process.send(value);
+  else console.log(JSON.stringify(value));
+}
+
 const [action, namespace] = process.argv.slice(2);
 const pool = new Pool({
   connectionString: process.env.PAYMENT_TEST_DATABASE_URL,
   max: 1,
+  connectionTimeoutMillis: 3000,
+  query_timeout: 5000,
 });
 const input = {
   key:
@@ -27,8 +34,9 @@ const input = {
 const store = new PostgresPaymentStateStore({ pool, namespace });
 await store.initialize();
 if (action === 'claim') {
-  console.log(JSON.stringify(await store.admit(input)));
+  report(await store.admit(input));
   await pool.end();
+  process.disconnect?.();
 } else if (action === 'invoice') {
   const result = await store.admit(input);
   if (result.status !== 'reserved')
@@ -42,7 +50,7 @@ if (action === 'claim') {
     invoice: { pmi: 'fake', amount: 10, pay_req: 'persisted-worker-invoice' },
     leaseMs: 10000,
   });
-  console.log(JSON.stringify(await store.read(record.key)));
+  report(await store.read(record.key));
   setInterval(() => {}, 1000);
 } else {
   throw new Error('Unknown payment test worker action');

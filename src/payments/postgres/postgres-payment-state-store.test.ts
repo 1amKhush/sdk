@@ -1,3 +1,4 @@
+import { withTimeout } from '../../core/utils/utils.js';
 import { describe, expect, test } from 'bun:test';
 import { Pool, type PoolClient } from 'pg';
 import { PostgresPaymentStateStore } from './postgres-payment-state-store.js';
@@ -72,8 +73,22 @@ async function withDatabase(
 function worker(
   action: string,
   namespace: string,
-): ReturnType<typeof Bun.spawn> {
-  return Bun.spawn(
+): {
+  ready: Promise<PaymentStateRecord | { status: string }>;
+  exited: Promise<number | null>;
+  kill: () => void;
+} {
+  let receive!: (value: PaymentStateRecord | { status: string }) => void;
+  let exit!: (code: number | null) => void;
+  const ready = new Promise<PaymentStateRecord | { status: string }>(
+    (resolve) => {
+      receive = resolve;
+    },
+  );
+  const exited = new Promise<number | null>((resolve) => {
+    exit = resolve;
+  });
+  const child = Bun.spawn(
     [
       process.execPath,
       'src/__mocks__/payment-state-worker.ts',
@@ -82,10 +97,26 @@ function worker(
     ],
     {
       env: { ...process.env, PAYMENT_TEST_DATABASE_URL: connectionString },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdin: 'ignore',
+      stdout: 'ignore',
+      stderr: 'inherit',
+      // IPC avoids unread pipe lifetimes interfering with Bun's exit notification.
+      ipc: (message) =>
+        receive(message as PaymentStateRecord | { status: string }),
+      onExit: (_child, code) => {
+        exit(code);
+      },
+      timeout: 10000,
+      killSignal: 'SIGKILL',
     },
   );
+  return {
+    ready: withTimeout(ready, 10000, 'Payment worker did not report readiness'),
+    exited: withTimeout(exited, 10000, 'Payment worker did not exit'),
+    kill: () => {
+      child.kill('SIGKILL');
+    },
+  };
 }
 
 databaseDescribe('PostgreSQL recovery and failure boundaries', () => {
@@ -135,14 +166,11 @@ databaseDescribe('PostgreSQL recovery and failure boundaries', () => {
         ];
         const outputs = await Promise.all(
           children.map(async (child) => {
-            const text = await new Response(
-              child.stdout as ReadableStream<Uint8Array>,
-            ).text();
-            const error = await new Response(
-              child.stderr as ReadableStream<Uint8Array>,
-            ).text();
-            expect(await child.exited, error).toBe(0);
-            return JSON.parse(text) as { status: string };
+            const result = await child.ready;
+            expect(await child.exited).toBe(0);
+            if (!('status' in result))
+              throw new Error('Claim worker returned no admission status');
+            return result;
           }),
         );
         expect(outputs.map((result) => result.status).sort()).toEqual([
@@ -158,15 +186,10 @@ databaseDescribe('PostgreSQL recovery and failure boundaries', () => {
       withDatabase(async (store, _pool, namespace) => {
         const child = worker('invoice', namespace);
         try {
-          const reader = (
-            child.stdout as ReadableStream<Uint8Array>
-          ).getReader();
-          const chunk = await reader.read();
-          const record = JSON.parse(
-            new TextDecoder().decode(chunk.value),
-          ) as PaymentStateRecord;
-          reader.releaseLock();
-          child.kill('SIGKILL');
+          const record = await child.ready;
+          if (!('key' in record))
+            throw new Error('Invoice worker returned no payment record');
+          child.kill();
           await child.exited;
           const pool = createPool();
           try {
@@ -320,3 +343,81 @@ function acknowledgementFault(pool: Pool): { pool: Pool; arm: () => void } {
     } as Pool,
   };
 }
+
+databaseTest(
+  'schema 1 upgrade preserves unresolved invoices and fences old workers',
+  async () =>
+    withDatabase(async (store, pool, namespace) => {
+      const input = admission();
+      const record = await bind(store, input);
+      await pool.query(
+        'UPDATE contextvm_payment_namespaces SET version = 1 WHERE namespace = $1',
+        [namespace],
+      );
+      await pool.query(
+        "UPDATE contextvm_payment_records SET retain_until_ms = 1, record = jsonb_set(record, '{retainUntilMs}', '1'::jsonb) WHERE namespace = $1",
+        [namespace],
+      );
+      const restarted = new PostgresPaymentStateStore({ pool, namespace });
+      await restarted.initialize();
+      const restored = await restarted.read(record.key);
+      expect(restored?.invoice).toEqual(record.invoice);
+      expect(restored?.retainUntilMs).toBeNull();
+      const version = await pool.query(
+        'SELECT version FROM contextvm_payment_namespaces WHERE namespace = $1',
+        [namespace],
+      );
+      expect(version.rows[0].version).toBe(2);
+    }),
+);
+
+databaseTest(
+  'lost result commit acknowledgement preserves the payload and one publication claim after reconnect',
+  async () =>
+    withDatabase(async (store, pool, namespace) => {
+      const { PaymentResultRecovery } = await import('../payment-recovery.js');
+      const input = admission('transparent');
+      const record = await bind(store, input);
+      const fence = { key: record.key, generation: record.generation };
+      await store.transition({ ...fence, type: 'settled', ttlMs: 10000 });
+      await store.transition({ ...fence, type: 'consume' });
+      const fault = acknowledgementFault(pool);
+      const uncertain = new PostgresPaymentStateStore({
+        pool: fault.pool,
+        namespace,
+      });
+      await uncertain.initialize();
+      const recovery = new PaymentResultRecovery(uncertain, {
+        publicationLeaseMs: 10000,
+      });
+      const response = {
+        jsonrpc: '2.0' as const,
+        id: input.requestEventId,
+        result: { value: 7 },
+      };
+      const snapshot = {
+        route: { clientPubkey: input.clientPubkey, originalRequestId: 42 },
+        expiresAtMs: Number.MAX_SAFE_INTEGER,
+      };
+      fault.arm();
+      await expect(
+        recovery.retain(input.requestEventId, response, snapshot),
+      ).rejects.toThrow('commit acknowledgement lost');
+      const restarted = new PaymentResultRecovery(store, {
+        publicationLeaseMs: 10000,
+      });
+      const claims = await Promise.allSettled([
+        restarted.prepare(input.requestEventId, response, snapshot),
+        restarted.prepare(input.requestEventId, response, snapshot),
+      ]);
+      expect(
+        claims.filter((result) => result.status === 'fulfilled'),
+      ).toHaveLength(1);
+      const winner = claims.find((result) => result.status === 'fulfilled');
+      if (winner?.status !== 'fulfilled')
+        throw new Error('No publication claimant');
+      await winner.value.framePublished(1);
+      await winner.value.complete();
+      expect((await store.read(input.key))?.delivery?.status).toBe('published');
+    }),
+);
