@@ -10,6 +10,22 @@ export interface PaymentOperationContext {
   deadlineMs?: number;
 }
 
+/** Runs provider work with cancellation, a bounded wait, and unconditional cleanup. */
+export async function runPaymentOperation<T>(
+  context: PaymentOperationContext,
+  timeoutMs: number,
+  shutdownSignal: AbortSignal,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const operation = paymentOperation(context, timeoutMs, shutdownSignal);
+  try {
+    operation.signal.throwIfAborted();
+    return await operation.wait(run(operation.signal));
+  } finally {
+    operation.dispose();
+  }
+}
+
 /** Owns a bounded operation; abort means the remote outcome may still be unknown. */
 export function paymentOperation(
   context: PaymentOperationContext = {},

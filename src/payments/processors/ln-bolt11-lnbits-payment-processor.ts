@@ -1,8 +1,9 @@
 import {
-  paymentOperation,
+  runPaymentOperation,
   type PaymentFetch,
 } from '../payment-cancellation.js';
 import type {
+  PaymentRequired,
   PaymentProcessor,
   PaymentProcessorCreateParams,
   PaymentProcessorVerifyParams,
@@ -82,29 +83,18 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
   /** Creates an invoice under the supplied cancellation/deadline context. */
   public async createPaymentRequired(
     params: PaymentProcessorCreateParams,
-  ): Promise<import('../types.js').PaymentRequired> {
-    const operation = paymentOperation(
+  ): Promise<PaymentRequired> {
+    return runPaymentOperation(
       params,
       this.ttlSeconds * 1000,
       this.shutdown.signal,
+      (signal) => this.createInternal({ ...params, abortSignal: signal }),
     );
-    try {
-      operation.signal.throwIfAborted();
-      return await operation.wait(
-        this.createInternal({ ...params, abortSignal: operation.signal }),
-      );
-    } finally {
-      operation.dispose();
-    }
   }
 
-  private async createInternal(params: PaymentProcessorCreateParams): Promise<{
-    amount: number;
-    pay_req: string;
-    description?: string;
-    pmi: string;
-    ttl?: number;
-  }> {
+  private async createInternal(
+    params: PaymentProcessorCreateParams,
+  ): Promise<PaymentRequired> {
     const body = JSON.stringify({
       out: false,
       amount: params.amount,
@@ -153,19 +143,12 @@ export class LnBolt11LnbitsPaymentProcessor implements PaymentProcessor {
   public async verifyPayment(
     params: PaymentProcessorVerifyParams,
   ): Promise<{ _meta?: Record<string, unknown> }> {
-    const operation = paymentOperation(
+    return runPaymentOperation(
       params,
       this.ttlSeconds * 1000,
       this.shutdown.signal,
+      (signal) => this.verifyInternal({ ...params, abortSignal: signal }),
     );
-    try {
-      operation.signal.throwIfAborted();
-      return await operation.wait(
-        this.verifyInternal({ ...params, abortSignal: operation.signal }),
-      );
-    } finally {
-      operation.dispose();
-    }
   }
 
   private async verifyInternal(

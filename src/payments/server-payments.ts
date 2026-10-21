@@ -33,6 +33,7 @@ import {
   serverPaymentStore,
 } from './server-payment-state.js';
 import { validateServerPaymentOptions } from './server-payment-validation.js';
+import { isLivePaymentLease } from './payment-state-machine.js';
 
 /** Server-side payment policy; both lifecycles share one atomic state store. */
 export interface ServerPaymentsOptions
@@ -129,7 +130,9 @@ export function createServerPaymentsMiddleware(params: {
       const recovering =
         admitted.status === 'duplicate' &&
         admitted.record?.invoice &&
-        ['pending', 'unknown', 'expired'].includes(admitted.record.phase);
+        ['pending', 'unknown', 'expired'].includes(admitted.record.phase) &&
+        (!isLivePaymentLease(admitted.record, Date.now()) ||
+          admitted.record.settlement !== undefined);
       if (admitted.status !== 'reserved' && !recovering) {
         if (admitted.status === 'duplicate' && admitted.record?.delivery)
           await params.onPaidDuplicate?.(admitted.record);

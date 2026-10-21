@@ -10,6 +10,7 @@ import type {
   NwcRequest,
   NwcResponse,
 } from './types.js';
+import { subscribePaymentEvents } from '../payment-subscription.js';
 import { queryTags } from '../../core/utils/utils.js';
 import {
   paymentOperation,
@@ -93,9 +94,6 @@ export class NwcClient {
     try {
       await operation.wait(this.connect());
 
-      let unsubscribe: (() => void) | undefined;
-      let settled = false;
-
       const promise = new Promise<ReadonlySet<string>>((resolve, reject) => {
         const filters: Filter[] = [
           {
@@ -105,45 +103,30 @@ export class NwcClient {
           },
         ];
 
-        void this.relayHandler
-          .subscribe(
-            filters,
-            (event) => {
-              if (
-                event.kind !== kinds.NWCWalletInfo ||
-                event.pubkey !== this.connection.walletPubkey ||
-                !verifyEvent(event)
-              )
-                return;
-              settled = true;
-              const tags = event.tags as string[][];
-              const raw = queryTags(tags, 'notifications').allValues.join(' ');
-              const types = raw
-                .split(/\s+/)
-                .map((t) => t.trim())
-                .filter(Boolean);
-              resolve(new Set(types));
-            },
-            () => {
-              if (settled) return;
-              settled = true;
-              resolve(new Set());
-            },
-          )
-          .then((u) => {
-            unsubscribe = u;
-            if (settled) unsubscribe();
-          })
-          .catch((error: unknown) => {
-            settled = true;
-            reject(error);
-          });
+        void subscribePaymentEvents(
+          this.relayHandler,
+          filters,
+          operation.signal,
+          (event) => {
+            if (
+              event.kind !== kinds.NWCWalletInfo ||
+              event.pubkey !== this.connection.walletPubkey ||
+              !verifyEvent(event)
+            )
+              return;
+            const tags = event.tags as string[][];
+            const raw = queryTags(tags, 'notifications').allValues.join(' ');
+            const types = raw
+              .split(/\s+/)
+              .map((t) => t.trim())
+              .filter(Boolean);
+            resolve(new Set(types));
+          },
+          () => resolve(new Set()),
+        ).catch(reject);
       });
 
-      return await operation.wait(promise).finally(() => {
-        settled = true;
-        unsubscribe?.();
-      });
+      return await operation.wait(promise);
     } finally {
       operation.dispose();
     }
@@ -195,28 +178,26 @@ export class NwcClient {
           !event.tags.some((t) => t[0] === 'p' && t[1] === clientPubkey)
         )
           return;
-        void (async () => {
-          try {
-            const decrypted = nip04.decrypt(
-              this.connection.clientSecretKeyHex,
-              event.pubkey,
-              event.content,
-            );
-            const parsed = JSON.parse(decrypted) as NwcNotificationPayload;
-            if (
-              typeof parsed !== 'object' ||
-              parsed === null ||
-              typeof parsed.notification_type !== 'string'
-            ) {
-              return;
-            }
-            params.onNotification(parsed);
-          } catch (error: unknown) {
-            this.logger.debug('failed to decrypt/parse nwc notification', {
-              error: error instanceof Error ? error.message : String(error),
-            });
+        try {
+          const decrypted = nip04.decrypt(
+            this.connection.clientSecretKeyHex,
+            event.pubkey,
+            event.content,
+          );
+          const parsed = JSON.parse(decrypted) as NwcNotificationPayload;
+          if (
+            typeof parsed !== 'object' ||
+            parsed === null ||
+            typeof parsed.notification_type !== 'string'
+          ) {
+            return;
           }
-        })();
+          params.onNotification(parsed);
+        } catch (error: unknown) {
+          this.logger.debug('failed to decrypt/parse nwc notification', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       });
 
       void subscription.then(
@@ -261,7 +242,13 @@ export class NwcClient {
       this.responseTimeoutMs,
       this.shutdown.signal,
     );
-    const run = async (): Promise<NwcResponse<M, R>> => {
+    const prev = this.requestQueue;
+    let release!: () => void;
+    this.requestQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await operation.wait(prev);
       operation.signal.throwIfAborted();
       const now = nowSeconds();
       await operation.wait(this.connect());
@@ -292,18 +279,7 @@ export class NwcClient {
 
       const signedRequest = finalizeEvent(eventTemplate, clientSecretKey);
 
-      let settled = false;
-      let unsubscribeResponse: (() => void) | undefined;
-      // Marks the attempt finished and releases the response subscription.
-      // Covers every exit path — including a response timeout or a publish
-      // failure that fires BEFORE relayHandler.subscribe() resolves — so a
-      // late-resolving subscription is always unsubscribed instead of leaking.
-      const settle = (): void => {
-        settled = true;
-        unsubscribeResponse?.();
-      };
-
-      let subscribed: Promise<() => void> | undefined;
+      let subscribed!: Promise<void>;
       const responsePromise = new Promise<NostrEvent>((resolve, reject) => {
         const filters: Filter[] = [
           {
@@ -320,37 +296,29 @@ export class NwcClient {
           filters,
         });
 
-        subscribed = this.relayHandler.subscribe(filters, (event) => {
-          if (
-            operation.signal.aborted ||
-            event.kind !== kinds.NWCWalletResponse ||
-            event.pubkey !== this.connection.walletPubkey ||
-            !verifyEvent(event) ||
-            queryTags(event.tags, 'e').firstValue !== signedRequest.id
-          )
-            return;
-          this.logger.debug('received response event', {
-            method: params.method,
-            requestId: signedRequest.id,
-            eventId: event.id,
-            pubkey: event.pubkey,
-          });
-          settled = true;
-          resolve(event);
-        });
-        void subscribed
-          .then((unsubscribe) => {
-            // Ensure the subscription is cleaned up when the promise settles,
-            // including the timeout/publish-failure paths handled by settle().
-            unsubscribeResponse = unsubscribe;
-            if (settled) {
-              unsubscribeResponse();
-            }
-          })
-          .catch((error: unknown) => {
-            settled = true;
-            reject(error);
-          });
+        subscribed = subscribePaymentEvents(
+          this.relayHandler,
+          filters,
+          operation.signal,
+          (event) => {
+            if (
+              operation.signal.aborted ||
+              event.kind !== kinds.NWCWalletResponse ||
+              event.pubkey !== this.connection.walletPubkey ||
+              !verifyEvent(event) ||
+              queryTags(event.tags, 'e').firstValue !== signedRequest.id
+            )
+              return;
+            this.logger.debug('received response event', {
+              method: params.method,
+              requestId: signedRequest.id,
+              eventId: event.id,
+              pubkey: event.pubkey,
+            });
+            resolve(event);
+          },
+        );
+        void subscribed.catch(reject);
       });
 
       this.logger.debug('publish request', {
@@ -359,67 +327,40 @@ export class NwcClient {
         encryption: 'nip04',
       });
       void responsePromise.catch(() => {});
-      try {
-        if (subscribed) await operation.wait(subscribed);
-        operation.signal.throwIfAborted();
-        await operation.wait(
-          this.relayHandler.publish(signedRequest, {
-            abortSignal: operation.signal,
-          }),
+      await operation.wait(subscribed);
+      operation.signal.throwIfAborted();
+      await operation.wait(
+        this.relayHandler.publish(signedRequest, {
+          abortSignal: operation.signal,
+        }),
+      );
+      const responseEvent = await operation.wait(responsePromise);
+
+      const decrypted = nip04.decrypt(
+        this.connection.clientSecretKeyHex,
+        responseEvent.pubkey,
+        responseEvent.content,
+      );
+
+      const parsed = JSON.parse(decrypted) as NwcResponse<M, unknown>;
+
+      if (parsed.result_type !== params.resultType) {
+        throw new Error(
+          `Unexpected NWC result_type: ${String(parsed.result_type)} (expected ${params.resultType})`,
         );
-        const responseEvent = await operation.wait(responsePromise);
-
-        // Validate correlation.
-        const eTag = queryTags(responseEvent.tags, 'e').firstValue;
-        if (eTag !== signedRequest.id) {
-          throw new Error('NWC response did not correlate to request');
-        }
-
-        const decrypted = nip04.decrypt(
-          this.connection.clientSecretKeyHex,
-          responseEvent.pubkey,
-          responseEvent.content,
-        );
-
-        const parsed = JSON.parse(decrypted) as NwcResponse<M, unknown>;
-
-        if (parsed.result_type !== params.resultType) {
-          throw new Error(
-            `Unexpected NWC result_type: ${String(parsed.result_type)} (expected ${params.resultType})`,
-          );
-        }
-
-        if (parsed.error) {
-          return parsed as NwcResponse<M, R>;
-        }
-
-        if (params.responseResultGuard && parsed.result !== null) {
-          if (!params.responseResultGuard(parsed.result)) {
-            throw new Error('Unexpected NWC result shape');
-          }
-        }
-
-        return parsed as NwcResponse<M, R>;
-      } catch (error) {
-        // Release the response subscription on every failure path — including
-        // timeouts and publish failures that fire before subscribe() resolves,
-        // so a late-resolving subscription is unsubscribed instead of leaking.
-        settle();
-        throw error;
-      } finally {
-        settle();
       }
-    };
 
-    const prev = this.requestQueue;
-    let release: (() => void) | undefined;
-    this.requestQueue = new Promise<void>((r) => {
-      release = r;
-    });
+      if (parsed.error) {
+        return parsed as NwcResponse<M, R>;
+      }
 
-    try {
-      await operation.wait(prev);
-      return await run();
+      if (params.responseResultGuard && parsed.result !== null) {
+        if (!params.responseResultGuard(parsed.result)) {
+          throw new Error('Unexpected NWC result shape');
+        }
+      }
+
+      return parsed as NwcResponse<M, R>;
     } finally {
       operation.dispose();
       // Keep queued operations serialized even when this caller leaves the queue early.

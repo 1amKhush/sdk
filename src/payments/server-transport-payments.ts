@@ -3,6 +3,7 @@ import { ObservedPaymentStateStore } from './observed-payment-state-store.js';
 import type { NostrServerTransport } from '../transport/nostr-server-transport.js';
 import type { PaymentInteractionPolicy } from './types.js';
 import type { ServerPaymentsOptions } from './server-payments.js';
+import type { PaymentStateRecord } from './payment-state-store.js';
 import { createCapTagsFromPricedCapabilities } from './cap-tags.js';
 import { createPmiTagsFromProcessors } from './pmi-tags.js';
 import { createServerPaymentsMiddleware } from './server-payments.js';
@@ -97,51 +98,31 @@ export function withServerPayments(
     });
   }
 
+  const middlewareParams = {
+    options,
+    processorsByPmi,
+    abortSignal,
+    // Capture before provider I/O so eviction cannot lose a paying client's route.
+    onPaymentPending: (id: string): void =>
+      transport.capturePaymentRouteSnapshot(
+        id,
+        Number.MAX_SAFE_INTEGER - Date.now(),
+      ),
+    onPaidDuplicate: (record: PaymentStateRecord): Promise<void> =>
+      transport.retryPaymentResult(record.clientPubkey, record.requestEventId),
+  };
   transport.addInboundMiddleware(
-    createServerPaymentsMiddleware({
-      sender: transport,
-      onPaymentPending: (id) =>
-        transport.capturePaymentRouteSnapshot(
-          id,
-          Number.MAX_SAFE_INTEGER - Date.now(),
-        ),
-      options,
-      processorsByPmi,
-      // Snapshot the correlation route when an invoice goes out so the paid
-      // response survives route-pop (duplicate cleanup) and session eviction.
-      onInvoiceIssued: ({ requestEventId }) =>
-        transport.capturePaymentRouteSnapshot(
-          requestEventId,
-          Number.MAX_SAFE_INTEGER - Date.now(),
-        ),
-      onPaidDuplicate: (record) =>
-        transport.retryPaymentResult(
-          record.clientPubkey,
-          record.requestEventId,
-        ),
-      abortSignal,
-    }),
+    createServerPaymentsMiddleware({ ...middlewareParams, sender: transport }),
   );
 
   // The transparent middleware self-gates on the per-session effective mode, so
   // it is safe to register the explicit-gating middleware alongside it. Each
   // request is routed to exactly one lifecycle based on the negotiated mode.
   if (supportsExplicitGating) {
-    const authorizationStore = stateStore;
     transport.addInboundMiddleware(
       createExplicitGatingMiddleware({
-        options,
-        authorizationStore,
-        onPaidDuplicate: (record) =>
-          transport.retryPaymentResult(
-            record.clientPubkey,
-            record.requestEventId,
-          ),
-        onPaymentPending: (id) =>
-          transport.capturePaymentRouteSnapshot(
-            id,
-            Number.MAX_SAFE_INTEGER - Date.now(),
-          ),
+        ...middlewareParams,
+        authorizationStore: stateStore,
         sendResponse: async (clientPubkey, response, requestEventId) => {
           await transport.sendTargetedResponse(
             clientPubkey,
@@ -149,13 +130,6 @@ export function withServerPayments(
             requestEventId,
           );
         },
-        processorsByPmi,
-        onInvoiceIssued: ({ requestEventId }) =>
-          transport.capturePaymentRouteSnapshot(
-            requestEventId,
-            Number.MAX_SAFE_INTEGER - Date.now(),
-          ),
-        abortSignal,
       }),
     );
   }

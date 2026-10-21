@@ -223,6 +223,46 @@ describe('server attempt generation fences', () => {
 });
 
 describe('server boundaries and transparent replay', () => {
+  test('a second worker leaves verification to the live invoice owner', async () => {
+    const settled = deferred<Record<string, never>>();
+    const started = deferred<undefined>();
+    let verifications = 0;
+    let executions = 0;
+    const options: ServerPaymentsOptions = {
+      stateStore: new InMemoryPaymentStateStore(),
+      pricedCapabilities: priced,
+      processors: [
+        {
+          ...processor(),
+          verifyPayment: () => {
+            verifications++;
+            started.resolve(undefined);
+            return settled.promise;
+          },
+        },
+      ],
+    };
+    const invoke = (): Promise<void> =>
+      createServerPaymentsMiddleware({
+        options,
+        sender: { sendNotification: async () => {} },
+      })(
+        request(),
+        { ...context, paymentInteraction: 'transparent' },
+        async () => {
+          executions++;
+        },
+      );
+    const first = invoke();
+    await started.promise;
+    const second = invoke();
+    await Bun.sleep(0);
+    settled.resolve({});
+    await Promise.all([first, second]);
+    expect(verifications).toBe(1);
+    expect(executions).toBe(1);
+  });
+
   test('transparent replay beyond the invoice TTL and middleware recreation never invoices or executes twice', async () => {
     let now = Date.now();
     const store = new InMemoryPaymentStateStore({}, () => now);

@@ -1,5 +1,5 @@
 import {
-  paymentOperation,
+  runPaymentOperation,
   type PaymentFetch,
 } from '../payment-cancellation.js';
 import type { PaymentHandler, PaymentHandlerRequest } from '../types.js';
@@ -56,13 +56,9 @@ export class LnBolt11LnbitsPaymentHandler implements PaymentHandler {
   }
 
   public async handle(req: PaymentHandlerRequest): Promise<void> {
-    const operation = paymentOperation(req, 60_000, this.shutdown.signal);
-    try {
-      operation.signal.throwIfAborted();
-      await operation.wait(this.pay({ ...req, abortSignal: operation.signal }));
-    } finally {
-      operation.dispose();
-    }
+    return runPaymentOperation(req, 60_000, this.shutdown.signal, (signal) =>
+      this.pay({ ...req, abortSignal: signal }),
+    );
   }
 
   private async pay(req: PaymentHandlerRequest): Promise<void> {

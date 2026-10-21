@@ -220,11 +220,20 @@ export class OutboundResponseRouter {
       // Restore the original request ID in the response
       responseToSend.id = route.originalRequestId;
 
-      // discovery tags already computed for the oversized-measurement branch, if it
-      // ran without fragmenting. buildOutboundTags() consumes the per-session
-      // discovery latch as a side effect, so the send path must reuse these rather
-      // than rebuild (otherwise the response ships with no discovery tags).
-      let oversizedTags: string[][] | undefined;
+      const continuationFrameTags = this.deps.createResponseTags(
+        route.clientPubkey,
+        nostrEventId,
+      );
+      // Build once: discovery/disclosure tags consume session latches.
+      const tags = this.deps.buildOutboundTags({
+        baseTags: continuationFrameTags,
+        session,
+      });
+      this.maybeAppendPaymentInteractionDisclosure(tags, session);
+      const giftWrapKind = this.deps.chooseGiftWrapKind({
+        session,
+        fallbackWrapKind: route.wrapKind,
+      });
 
       // CEP-22 Oversized Transfer (proactive path for server responses)
       if (
@@ -233,20 +242,6 @@ export class OutboundResponseRouter {
           (this.deps.oversizedConfig.enabled &&
             session.supportsOversizedTransfer))
       ) {
-        const continuationFrameTags = this.deps.createResponseTags(
-          route.clientPubkey,
-          nostrEventId,
-        );
-        const startFrameTags = this.deps.buildOutboundTags({
-          baseTags: continuationFrameTags,
-          session,
-        });
-        this.maybeAppendPaymentInteractionDisclosure(startFrameTags, session);
-        const giftWrapKind = this.deps.chooseGiftWrapKind({
-          session,
-          fallbackWrapKind: route.wrapKind,
-        });
-
         // Measuring the full response can throw under gift-wrap encryption when
         // the inner plaintext exceeds NIP-44's 65 535-byte cap. That is itself
         // proof the response cannot be published as a single encrypted event, so
@@ -257,7 +252,7 @@ export class OutboundResponseRouter {
             responseToSend,
             route.clientPubkey,
             CTXVM_MESSAGES_KIND,
-            startFrameTags,
+            tags,
             session.isEncrypted,
             giftWrapKind,
           );
@@ -291,7 +286,7 @@ export class OutboundResponseRouter {
               serialized,
               clientPubkey: route.clientPubkey,
               progressToken: route.progressToken,
-              startFrameTags,
+              startFrameTags: tags,
               continuationFrameTags,
               isEncrypted: session.isEncrypted,
               giftWrapKind,
@@ -315,37 +310,9 @@ export class OutboundResponseRouter {
             },
           );
           await publication?.complete();
-          // CEP-35 discovery tags ride on the start frame (startFrameTags) above.
-          // Payment-interaction disclosure is also covered: the server's
-          // availability advertisement (extraCommonTags, e.g.
-          // ['payment_interaction','explicit_gating']) flows through getCommonTags()
-          // into startFrameTags, and its value always equals the effective session
-          // mode when both are present — so no separate disclosure call is needed.
           return;
         }
-
-        // Response fit in a single event: reuse the tags already built for
-        // measurement instead of rebuilding, which would drop discovery tags.
-        oversizedTags = startFrameTags;
       }
-
-      // Send the response back to the original requester
-      const tags =
-        oversizedTags ??
-        this.deps.buildOutboundTags({
-          baseTags: this.deps.createResponseTags(
-            route.clientPubkey,
-            nostrEventId,
-          ),
-          session,
-        });
-
-      this.maybeAppendPaymentInteractionDisclosure(tags, session);
-
-      const giftWrapKind = this.deps.chooseGiftWrapKind({
-        session,
-        fallbackWrapKind: route.wrapKind,
-      });
 
       // Attach pricing tags to capability list responses so clients can access CEP-8 pricing
       if (isJSONRPCResultResponse(responseToSend)) {

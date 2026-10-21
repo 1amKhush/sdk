@@ -1,7 +1,8 @@
 import {
-  paymentOperation,
+  runPaymentOperation,
   type PaymentFetch,
 } from '../payment-cancellation.js';
+import { subscribePaymentEvents } from '../payment-subscription.js';
 import { kinds, type Filter, type NostrEvent } from 'nostr-tools';
 import {
   finalizeEvent,
@@ -19,6 +20,7 @@ import {
   getBolt11FromZapReceipt,
 } from '../nip57/zap-events.js';
 import type {
+  PaymentRequired,
   PaymentProcessor,
   PaymentProcessorCreateParams,
   PaymentProcessorVerifyParams,
@@ -113,30 +115,18 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
   /** Creates a zap invoice with bounded, cancellable HTTP work. */
   public async createPaymentRequired(
     params: PaymentProcessorCreateParams,
-  ): Promise<import('../types.js').PaymentRequired> {
-    const operation = paymentOperation(
+  ): Promise<PaymentRequired> {
+    return runPaymentOperation(
       params,
       this.ttlSeconds * 1000,
       this.shutdown.signal,
+      (signal) => this.createInternal({ ...params, abortSignal: signal }),
     );
-    try {
-      operation.signal.throwIfAborted();
-      return await operation.wait(
-        this.createInternal({ ...params, abortSignal: operation.signal }),
-      );
-    } finally {
-      operation.dispose();
-    }
   }
 
-  private async createInternal(params: PaymentProcessorCreateParams): Promise<{
-    amount: number;
-    pay_req: string;
-    description?: string;
-    pmi: string;
-    ttl?: number;
-    _meta?: Record<string, unknown>;
-  }> {
+  private async createInternal(
+    params: PaymentProcessorCreateParams,
+  ): Promise<PaymentRequired> {
     if (this.relayUrls.length === 0) {
       throw new Error(
         'LnBolt11ZapPaymentProcessor requires relayUrls or a relayHandler with getRelayUrls() for verification',
@@ -218,27 +208,21 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
     if (this.activeVerifications >= this.maxInFlightVerifications)
       throw new Error('Zap verification capacity reached');
     this.activeVerifications++;
-    const operation = paymentOperation(
-      params,
-      this.ttlSeconds * 1000,
-      this.shutdown.signal,
-    );
     try {
-      operation.signal.throwIfAborted();
-      return await operation.wait(
-        this.verifyPaymentInternal({
-          ...params,
-          abortSignal: operation.signal,
-        }),
+      return await runPaymentOperation(
+        params,
+        this.ttlSeconds * 1000,
+        this.shutdown.signal,
+        (signal) =>
+          this.verifyPaymentInternal({ ...params, abortSignal: signal }),
       );
     } finally {
-      operation.dispose();
       this.activeVerifications--;
     }
   }
 
   private async verifyPaymentInternal(
-    params: PaymentProcessorVerifyParams,
+    params: PaymentProcessorVerifyParams & { abortSignal: AbortSignal },
   ): Promise<{ _meta?: Record<string, unknown> }> {
     if (this.relayUrls.length === 0) {
       throw new Error(
@@ -246,8 +230,8 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
       );
     }
 
-    const pending = this.pendingInvoices.get(params.pay_req);
-    if (!pending) {
+    let meta = this.pendingInvoices.get(params.pay_req);
+    if (!meta) {
       // Stateless fallback: re-fetch pay params to get the expected zapper pubkey.
       const payParams = await fetchLnurlPayParams({
         lnAddress: this.lnAddress,
@@ -257,18 +241,12 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
       if (!payParams.nostrPubkey) {
         throw new Error('Cannot verify zap receipt: missing lnurl nostrPubkey');
       }
-      this.pendingInvoices.set(params.pay_req, {
+      meta = {
         expectedZapperPubkey: payParams.nostrPubkey,
         since: 0,
         amountMsats: NaN,
-      });
-    }
-
-    const meta = this.pendingInvoices.get(params.pay_req);
-    if (!meta) {
-      throw new Error(
-        'Cannot verify zap receipt: missing pending invoice metadata',
-      );
+      };
+      this.pendingInvoices.set(params.pay_req, meta);
     }
 
     const filter: Filter = {
@@ -285,35 +263,12 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
     });
 
     const receiptPromise = new Promise<NostrEvent>((resolve, reject) => {
-      let unsubscribe: (() => void) | undefined;
-      let settled = false;
-
-      const onAbort = () => {
-        settled = true;
-        cleanup();
-        reject(new Error('verifyPayment aborted'));
-      };
-
-      const cleanup = () => {
-        try {
-          unsubscribe?.();
-        } catch {
-          // best-effort
-        }
-        unsubscribe = undefined;
-        params.abortSignal?.removeEventListener('abort', onAbort);
-      };
-
-      params.abortSignal?.addEventListener('abort', onAbort, { once: true });
-
-      if (params.abortSignal?.aborted) {
-        onAbort();
-        return;
-      }
-      void this.relayHandler
-        .subscribe([filter], (event) => {
+      void subscribePaymentEvents(
+        this.relayHandler,
+        [filter],
+        params.abortSignal,
+        (event) => {
           if (
-            settled ||
             event.pubkey !== meta.expectedZapperPubkey ||
             event.kind !== kinds.Zap ||
             !verifyEvent(event)
@@ -327,28 +282,12 @@ export class LnBolt11ZapPaymentProcessor implements PaymentProcessor {
               requestEventId: params.requestEventId,
               zapReceiptEventId: event.id,
             });
-            settled = true;
-            cleanup();
             resolve(event);
           } catch (error: unknown) {
-            settled = true;
-            cleanup();
             reject(error);
           }
-        })
-        .then((u) => {
-          unsubscribe = u;
-          if (settled) {
-            // Event/abort/error may have fired before subscribe resolved.
-            unsubscribe();
-            unsubscribe = undefined;
-          }
-        })
-        .catch((error: unknown) => {
-          settled = true;
-          cleanup();
-          reject(error);
-        });
+        },
+      ).catch(reject);
     });
 
     const receipt = await receiptPromise;
