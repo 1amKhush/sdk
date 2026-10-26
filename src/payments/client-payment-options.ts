@@ -40,9 +40,10 @@ export interface ClientPaymentsOptions {
   /** Optional limits across all automatic payment offers for one invocation. */
   limits?: ClientPaymentLimits;
   /**
-   * Maximum distinct payment identities retained by this wrapper. Completed and
-   * uncertain attempts are never evicted to make room for a new payment.
-   * At capacity, new attempts fail without invoking a wallet. @default 1000
+   * Maximum distinct payment identities retained by this wrapper. In-flight and
+   * unknown attempts stay pinned; handled and declined identities are evicted
+   * least recently used first. New attempts fail before wallet work if pinned
+   * identities and offered options cannot fit. Zero refuses payment. @default 1000
    * Explicit callbacks reserve every offered identity because option selection
    * is opaque; they must pay only one of the supplied options.
    */

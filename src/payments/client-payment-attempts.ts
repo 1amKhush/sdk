@@ -1,4 +1,5 @@
 import type { PaymentOption } from './types.js';
+import { LruCache } from '../core/utils/lru-cache.js';
 import { ClientPaymentError } from './client-payment-validation.js';
 
 type AttemptOutcome = 'in_flight' | 'handled' | 'declined' | 'unknown';
@@ -13,15 +14,18 @@ export interface ClientPaymentAttempt {
 /**
  * Wrapper-scoped attempt history. A Nostr wrapper is bound to one authenticated
  * server; generic wrappers use their transport instance as the peer boundary.
- * No live/completed/unknown entry is evicted and silently made payable again.
+ * In-flight and unknown attempts stay pinned; handled and declined identities
+ * may be evicted least recently used first under capacity pressure.
  */
 export class ClientPaymentAttempts {
-  private readonly entries = new Map<
-    string,
-    { amount: number; attempt: ClientPaymentAttempt }
-  >();
+  private readonly entries: LruCache<{
+    amount: number;
+    attempt: ClientPaymentAttempt;
+  }>;
 
-  public constructor(private readonly maxEntries: number) {}
+  public constructor(private readonly maxEntries: number) {
+    this.entries = new LruCache(maxEntries);
+  }
 
   private key(option: PaymentOption): string {
     return JSON.stringify([option.pmi, option.pay_req]);
@@ -59,12 +63,20 @@ export class ClientPaymentAttempts {
     signal: AbortSignal,
   ): ClientPaymentAttempt {
     const unique = new Map(options.map((option) => [this.key(option), option]));
-    if (this.entries.size + unique.size > this.maxEntries) {
+    const needed = this.entries.size + unique.size - this.maxEntries;
+    const evictable: string[] = [];
+    for (const [key, { attempt }] of this.entries.entries()) {
+      if (evictable.length >= needed) break;
+      if (attempt.outcome === 'handled' || attempt.outcome === 'declined')
+        evictable.push(key);
+    }
+    if (evictable.length < needed) {
       throw new ClientPaymentError(
         'payment_attempt_capacity',
-        'Client payment attempt capacity reached',
+        'Client payment attempt capacity exceeded by unresolved payments or offered options',
       );
     }
+    for (const key of evictable) this.entries.delete(key);
     let resolve!: () => void;
     const attempt: ClientPaymentAttempt = {
       outcome: 'in_flight',
