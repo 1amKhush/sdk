@@ -69,6 +69,7 @@ describe('client payment attempt reliability', () => {
     let calls = 0;
     await run(
       {
+        maxTrackedPaymentAttempts: 1,
         onPaymentRequired: async () => {
           calls++;
           throw new Error('wallet response lost');
@@ -84,6 +85,13 @@ describe('client payment attempt reliability', () => {
         expect(calls).toBe(1);
         expect(failures(h)[1]?.error.data).toMatchObject({
           reason: 'payment_outcome_unknown',
+        });
+        await h.paid.send(request(3));
+        h.deliver(required(3, [option('replacement')]));
+        await waitFor(() => failures(h).length === 3);
+        expect(calls).toBe(1);
+        expect(failures(h)[2]?.error.data).toMatchObject({
+          reason: 'payment_attempt_capacity',
         });
       },
     );
@@ -138,7 +146,7 @@ describe('client payment attempt reliability', () => {
     });
   });
 
-  test('attempt capacity refuses a new invoice without forgetting a completed payment', async () => {
+  test('completed history does not exhaust a long-lived client payment capacity', async () => {
     let calls = 0;
     await run(
       {
@@ -149,21 +157,14 @@ describe('client payment attempt reliability', () => {
         },
       },
       async (h) => {
-        await h.paid.send(request());
-        h.deliver(required());
-        await waitFor(() => h.sent.length === 2);
-        h.deliver({ jsonrpc: '2.0', id: 1, result: {} });
-        await h.paid.send(request(2));
-        h.deliver(required(2, [option('new-invoice')]));
-        await waitFor(() => failures(h).length === 1);
-        expect(calls).toBe(1);
-        expect(failures(h)[0]?.error.data).toMatchObject({
-          reason: 'payment_attempt_capacity',
-        });
-        await h.paid.send(request(3));
-        h.deliver(required(3));
-        await waitFor(() => h.sent.length === 5);
-        expect(calls).toBe(1);
+        for (let id = 1; id <= 3; id++) {
+          await h.paid.send(request(id));
+          h.deliver(required(id, [option(`invoice-${id}`)]));
+          await waitFor(() => h.sent.length === id * 2);
+          h.deliver({ jsonrpc: '2.0', id, result: {} });
+        }
+        expect(calls).toBe(3);
+        expect(failures(h)).toHaveLength(0);
       },
     );
   });

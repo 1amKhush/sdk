@@ -57,12 +57,12 @@ describe('instant explicit payment retry delivery', () => {
       let invoices = 0;
       let approvals = 0;
       const processor: PaymentProcessor = {
-        pmi: 'fake',
+        pmi: 'pmi:A',
         async createPaymentRequired(params) {
           invoices++;
           return {
             amount: params.amount,
-            pmi: 'fake',
+            pmi: 'pmi:A',
             pay_req: `invoice-${invoices}`,
             ttl: 60,
           };
@@ -112,7 +112,9 @@ describe('instant explicit payment retry delivery', () => {
       const paid = withClientPayments(base, {
         paymentInteraction: 'explicit_gating',
         minRetryDelayMs: 0,
-        async onPaymentRequired() {
+        limits: { maxAmountByPmi: { 'pmi:A': 5 } },
+        async onPaymentRequired({ options }) {
+          expect(options[0]?.pmi).toBe('pmi:A');
           approvals++;
           return { paid: true };
         },
