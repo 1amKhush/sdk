@@ -6,7 +6,10 @@ import type {
   PricedCapability,
   ResolvePriceResult,
 } from './types.js';
-import { paymentOptionSchema } from './payment-option-schema.js';
+import {
+  paymentOptionSchema,
+  paymentPmiSchema,
+} from './payment-option-schema.js';
 import {
   createPaymentStatePolicy,
   type PaymentStatePolicy,
@@ -65,7 +68,7 @@ export function validateServerPaymentOptions(
   const schema = z.object({
     processors: z.array(
       z.object({
-        pmi: z.string().regex(/^[a-z0-9-]+$/),
+        pmi: paymentPmiSchema,
         currencyUnit: unit.optional(),
       }),
     ),

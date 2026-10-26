@@ -716,6 +716,9 @@ describe('Explicit Gating Middleware', () => {
     expect(sentResponses).toHaveLength(1);
     expect(sentResponses[0].error.code).toBe(-32000);
     expect(sentResponses[0].error.data).toEqual({ reason: 'payment_expired' });
+    expect(sentResponses[0].error.message).toContain(
+      'contact the server operator',
+    );
   });
 
   test('non-priced capability passes through ungated in explicit gating mode', async () => {
