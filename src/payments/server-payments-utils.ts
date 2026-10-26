@@ -1,6 +1,7 @@
 import type { JSONRPCRequest } from '@contextvm/mcp-sdk/types.js';
 import { type Logger } from '../core/utils/logger.js';
 import { withTimeout } from '../core/utils/utils.js';
+import { paymentPmiSchema } from './payment-option-schema.js';
 import {
   validateProcessorPayment,
   validateServerQuote,
@@ -103,9 +104,7 @@ export function resolvePaymentProcessor(
   if (
     clientPmis !== undefined &&
     (!Array.isArray(clientPmis) ||
-      clientPmis.some(
-        (pmi) => typeof pmi !== 'string' || !/^[a-z0-9-]+$/.test(pmi),
-      ))
+      clientPmis.some((pmi) => !paymentPmiSchema.safeParse(pmi).success))
   )
     throw new PaymentMethodUnavailableError(
       'Invalid client payment method identifier',
