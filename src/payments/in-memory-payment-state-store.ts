@@ -19,6 +19,7 @@ let memoryStoreSequence = 0;
 /** Single-process default; live grants and uncertain outcomes are never evicted. */
 export class InMemoryPaymentStateStore implements PaymentStateStore {
   public readonly policy: PaymentStatePolicy;
+  // Collect by replay deadlines, not LRU recency: evicting a tombstone can repeat payment or execution.
   private readonly records = new Map<string, PaymentStateRecord>();
   private observedAtMs = 0;
   private readonly storeSequence = ++memoryStoreSequence;

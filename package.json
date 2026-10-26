@@ -72,10 +72,6 @@
     "./payments/*": {
       "types": "./dist/esm/payments/*.d.ts",
       "default": "./dist/esm/payments/*.js"
-    },
-    "./payments/postgres": {
-      "types": "./dist/esm/payments/postgres/index.d.ts",
-      "default": "./dist/esm/payments/postgres/index.js"
     }
   },
   "types": "./dist/esm/index.d.ts",
@@ -96,11 +92,9 @@
     "@changesets/cli": "^2.31.1",
     "@eslint/js": "^9.39.5",
     "@types/bun": "^1.4.2",
-    "@types/pg": "^8.23.1",
     "eslint": "^9.39.5",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-import": "^2.32.0",
-    "pg": "^8.23.1",
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.70.0"
@@ -115,13 +109,5 @@
     "rxjs": "^7.8.2",
     "ws": "^8.21.3",
     "zod": "^4.5.4"
-  },
-  "peerDependencies": {
-    "pg": "^8.23.1"
-  },
-  "peerDependenciesMeta": {
-    "pg": {
-      "optional": true
-    }
   }
 }

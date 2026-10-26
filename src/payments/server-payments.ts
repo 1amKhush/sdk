@@ -42,7 +42,7 @@ export interface ServerPaymentsOptions extends Partial<PaymentStatePolicy> {
   paymentTtlMs?: number;
   /** Lifetime of a verified execution grant, measured from settlement. @default paymentTtlMs */
   authorizationTtlMs?: number;
-  /** Injectable backend. Initialize durable stores before attaching the transport. */
+  /** Injectable atomic store. The default is process-local and loses state on restart. */
   stateStore?: PaymentStateStore;
   /** Accepted interaction modes. @default 'optional' */
   paymentInteraction?: PaymentInteractionPolicy;
