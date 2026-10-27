@@ -16,6 +16,8 @@ import { NOSTR_TAGS } from '../core/constants.js';
 
 /**
  * Attaches CEP-8 payments gating to a NostrServerTransport.
+ * One paying server identity must run in one process with the default in-memory
+ * store. It cannot coordinate payments across processes or retain state after restart.
  *
  * By default the server uses the `optional` policy: it advertises
  * `explicit_gating` support and mirrors each client's requested lifecycle, so a

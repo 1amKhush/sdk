@@ -138,7 +138,7 @@ describe('createServerPaymentsMiddleware pending-payment retention', () => {
     );
     expect(harness.invoiceCount('evt1')).toBe(1);
 
-    // The durable event record refuses another invoice even after the local run ends.
+    // The retained event record refuses another invoice even after the local run ends.
     await expect(harness.run('evt1')).rejects.toThrow(
       'payment rail unreachable',
     );

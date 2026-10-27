@@ -109,6 +109,14 @@ export function validateClientPaymentOptions(
       .optional(),
     paymentInteraction: z.enum(['transparent', 'explicit_gating']).optional(),
     handlers: z.array(z.object({ pmi: pmiSchema })).optional(),
+    onPaymentRequired: z
+      .unknown()
+      .refine((value) => typeof value === 'function')
+      .optional(),
+    paymentPolicy: z
+      .unknown()
+      .refine((value) => typeof value === 'function')
+      .optional(),
     limits: z
       .object({
         maxAmountByPmi: z.record(pmiSchema, amountSchema).optional(),

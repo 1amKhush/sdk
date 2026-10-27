@@ -10,19 +10,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17.7-bookworm
-        env:
-          POSTGRES_PASSWORD: contextvm-test
-          POSTGRES_DB: contextvm_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d contextvm_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
 
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +33,6 @@ jobs:
           LNBITS_INTEGRATION: 'false'
           ZAP_INTEGRATION: 'false'
           NODE_ENV: test
-          PAYMENT_TEST_DATABASE_URL: postgres://postgres:contextvm-test@127.0.0.1:5432/contextvm_test
         run: bun test --concurrent --timeout=60000
 
       - name: Check types and lint

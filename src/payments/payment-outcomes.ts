@@ -76,7 +76,7 @@ export function emitPaymentOutcome(
   }
 }
 
-/** Builds a redacted server milestone from an existing durable attempt. */
+/** Builds a redacted server milestone from an existing recorded attempt. */
 export function recordPaymentOutcome(
   options: PaymentOutcomeOptions,
   record: PaymentStateRecord,

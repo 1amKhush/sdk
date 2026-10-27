@@ -94,7 +94,8 @@ function cancelledRequestId(
  * Wraps a transport with validated CEP-8 offers, bounded payment attempts, and
  * request-owned retries. Nostr peers are authenticated by their transport;
  * generic transports isolate attempt history per wrapper and must keep their
- * peer identity stable. History is retained for the lifetime of the wrapper.
+ * peer identity stable. In-flight and unknown attempts stay pinned; terminal
+ * history is bounded and may be evicted under capacity pressure.
  *
  * Unmatched handlers leave transparent payment to the application. Generic
  * notifications without request correlation support legacy handler execution,
@@ -151,6 +152,11 @@ export function withClientPayments(
     code = -32000,
     data: Record<string, unknown> = {},
   ): void => {
+    logger.info('Client payment failed', {
+      requestId: state.id,
+      reason: data.type === 'payment_handler_error' ? data.type : error.reason,
+      outcome: data.outcome,
+    });
     const kind =
       error.reason === 'payment_request_capacity'
         ? 'evicted'
@@ -242,6 +248,11 @@ export function withClientPayments(
       },
       Math.max(delayMs, minRetryDelayMs),
     );
+    logger.debug('Payment retry scheduled', {
+      requestId: state.id,
+      delayMs: Math.max(delayMs, minRetryDelayMs),
+      code,
+    });
   };
 
   const priorOutcome = async (
@@ -249,6 +260,10 @@ export function withClientPayments(
     attempt: ClientPaymentAttempt,
     explicit: boolean,
   ): Promise<void> => {
+    logger.debug('Payment offer deduplicated', {
+      requestId: state.id,
+      outcome: attempt.outcome,
+    });
     await attempt.completion;
     if (!lifecycle.isActive(state)) return;
     if (attempt.outcome === 'handled') {
@@ -319,6 +334,10 @@ export function withClientPayments(
     const allowed = lifecycle.approve(state, data.payment_options);
     const attempt = attempts.reserve(allowed, state.controller.signal);
     state.paymentInFlight = true;
+    logger.debug('Explicit payment offer accepted; invoking approval handler', {
+      requestId: state.id,
+      optionCount: allowed.length,
+    });
     try {
       const result = await options.onPaymentRequired({
         options: allowed,
@@ -437,6 +456,11 @@ export function withClientPayments(
     lifecycle.approve(state, [option]);
     const attempt = attempts.reserve([option], state.controller.signal);
     state.paymentInFlight = true;
+    logger.debug('Transparent payment offer accepted', {
+      requestId: state.id,
+      pmi: option.pmi,
+      amount: option.amount,
+    });
     const req: PaymentHandlerRequest = {
       amount: option.amount,
       pmi: option.pmi,
@@ -488,6 +512,11 @@ export function withClientPayments(
         );
       }
       walletStarted = true;
+      logger.debug('Invoking payment handler', {
+        requestId: state.id,
+        pmi: option.pmi,
+        amount: option.amount,
+      });
       await handler.handle(req);
       if (lifecycle.isActive(state)) attempt.complete('handled');
     } catch (error: unknown) {

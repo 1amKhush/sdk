@@ -68,7 +68,7 @@ const snapshot: RouteSnapshot = {
   expiresAtMs: Number.MAX_SAFE_INTEGER,
 };
 
-describe('durable settlement and result recovery', () => {
+describe('recorded settlement and result recovery', () => {
   test('late settlement recovers the same generation, one grant, no invoice creation', async () => {
     let now = Date.now();
     const store = new InMemoryPaymentStateStore({}, () => now);
@@ -252,5 +252,37 @@ describe('durable settlement and result recovery', () => {
     await Bun.sleep(0);
     expect(collected).toHaveLength(1);
     expect(JSON.stringify(collected)).not.toContain('secret');
+  });
+
+  test('a fresh default store cannot recover results retained by another store', async () => {
+    const store = new InMemoryPaymentStateStore();
+    const record = await issued(store, 'transparent');
+    const fence = { key: record.key, generation: record.generation };
+    await store.transition({ ...fence, type: 'settled', ttlMs: 10000 });
+    await store.transition({ ...fence, type: 'consume' });
+    const response = { jsonrpc: '2.0' as const, id: 'offer', result: {} };
+    const recovery = new PaymentResultRecovery(store, {
+      publicationLeaseMs: 10000,
+    });
+    await recovery.retain('offer', response, snapshot);
+    expect((await store.read(record.key))?.delivery?.response).toEqual(
+      response,
+    );
+
+    const fresh = new PaymentResultRecovery(new InMemoryPaymentStateStore(), {
+      publicationLeaseMs: 10000,
+    });
+    let publications = 0;
+    await expect(
+      fresh.replay(
+        'client',
+        'offer',
+        () => {},
+        async () => {
+          publications++;
+        },
+      ),
+    ).rejects.toThrow('No recorded paid result');
+    expect(publications).toBe(0);
   });
 });

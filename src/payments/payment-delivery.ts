@@ -1,7 +1,7 @@
 import type { JSONRPCResponse } from '@contextvm/mcp-sdk/types.js';
 import type { RouteSnapshot } from '../transport/nostr-server/correlation-store.js';
 
-/** Durable result and route. Applications must protect the store as they protect paid result content. */
+/** Recorded result and route. Applications must protect the store as they protect paid result content. */
 export interface PaymentResultDelivery {
   response: JSONRPCResponse;
   snapshot: RouteSnapshot;

@@ -48,7 +48,7 @@ export interface ServerPaymentsOptions
   paymentTtlMs?: number;
   /** Lifetime of a verified execution grant, measured from settlement. @default paymentTtlMs */
   authorizationTtlMs?: number;
-  /** Injectable backend. Initialize durable stores before attaching the transport. */
+  /** Application-owned atomic backend; defaults to process-local memory. The SDK does not initialize or close custom backends. */
   stateStore?: PaymentStateStore;
   /** Accepted interaction modes. @default 'optional' */
   paymentInteraction?: PaymentInteractionPolicy;

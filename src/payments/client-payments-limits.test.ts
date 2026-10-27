@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Transport } from '@contextvm/mcp-sdk/shared/transport';
 import { withClientPayments } from './client-payments.js';
+import type { ClientPaymentsOptions } from './client-payment-options.js';
 import type { PaymentOption } from './types.js';
 import {
   run,
@@ -175,7 +176,8 @@ describe('client payment limits and validation', () => {
     { ...option(), amount: Infinity },
     { ...option(), amount: Number.MAX_SAFE_INTEGER + 1 },
     { ...option(), amount: '5' },
-    { ...option(), pmi: 'INVALID:PMI' },
+    { ...option(), pmi: '' },
+    { ...option(), pmi: 1 },
     { ...option(), pay_req: '' },
     { ...option(), pay_req: '   ' },
     { ...option(), ttl: 0 },
@@ -210,9 +212,55 @@ describe('client payment limits and validation', () => {
     });
   }
 
+  for (const mode of ['transparent', 'explicit'] as const) {
+    test(`accepts a non-kebab PMI in ${mode} offers, handlers, and amount limits`, async () => {
+      const pmi = 'pmi:A';
+      const paid: PaymentOption[] = [];
+      await run(
+        {
+          limits: { maxAmountByPmi: { [pmi]: 5 } },
+          handlers: [
+            {
+              pmi,
+              async handle(req): Promise<void> {
+                paid.push(req);
+              },
+            },
+          ],
+          onPaymentRequired: async ({ options }) => {
+            paid.push(...options);
+            return { paid: true };
+          },
+        },
+        async (h) => {
+          await h.paid.send(request());
+          h.deliver(
+            mode === 'transparent'
+              ? offer(option('invoice', 5, pmi))
+              : required(1, [option('invoice', 5, pmi)]),
+          );
+          await waitFor(() => paid.length === 1);
+          expect(paid[0]).toMatchObject(option('invoice', 5, pmi));
+          expect(failures(h)).toHaveLength(0);
+          h.deliver(
+            mode === 'transparent'
+              ? offer(option('replacement', 1, pmi))
+              : required(1, [option('replacement', 1, pmi)]),
+          );
+          await waitFor(() => failures(h).length === 1);
+          expect(paid).toHaveLength(1);
+          expect(failures(h)[0]?.error.data).toMatchObject({
+            reason: 'payment_limit_exceeded',
+          });
+        },
+      );
+    });
+  }
+
   for (const invalid of [
     [],
     [option(), { ...option('invalid'), amount: -1 }],
+    [{ ...option(), pmi: '' }],
     [option(), option('invoice', 6)],
   ]) {
     test(`validates every explicit option ${JSON.stringify(invalid)}`, async () => {
@@ -318,6 +366,11 @@ describe('client payment limits and validation', () => {
     { limits: { timeoutMs: 2_147_483_648 } },
     { limits: { maxAttempts: -1 } },
     { limits: { maxAmountByPmi: { fake: Infinity } } },
+    { handlers: [{ pmi: '', handle: async () => {} }] },
+    { limits: { maxAmountByPmi: { '': 1 } } },
+    ...['onPaymentRequired', 'paymentPolicy'].flatMap((key) =>
+      [true, false, null, 1, 'typo', {}].map((value) => ({ [key]: value })),
+    ),
   ]) {
     test(`configuration validation rejects ${JSON.stringify(options)} before wrapping`, () => {
       const base: Transport = {
@@ -325,9 +378,9 @@ describe('client payment limits and validation', () => {
         async send(): Promise<void> {},
         async close(): Promise<void> {},
       };
-      expect(() => withClientPayments(base, options)).toThrow(
-        'Invalid client payment options',
-      );
+      expect(() =>
+        withClientPayments(base, options as ClientPaymentsOptions),
+      ).toThrow('Invalid client payment options');
       expect(() => withClientPayments(base, {})).not.toThrow();
     });
   }

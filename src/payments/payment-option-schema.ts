@@ -5,7 +5,8 @@ export const paymentAmountSchema = z
   .finite()
   .nonnegative()
   .max(Number.MAX_SAFE_INTEGER);
-export const paymentPmiSchema = z.string().regex(/^[a-z0-9-]+$/);
+/** Opaque, exact-match identifiers, including HTTPS methods and existing custom rails. */
+export const paymentPmiSchema = z.string().min(1).max(2048);
 
 /** Runtime offer schema; unknown extension metadata is preserved. */
 export const paymentOptionSchema = z.object({

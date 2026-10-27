@@ -9,6 +9,8 @@ import { InMemoryPaymentStateStore } from './in-memory-payment-state-store.js';
 import {
   paymentAuthorizationKey,
   paymentEventKey,
+  createPaymentStatePolicy,
+  type PaymentStateStore,
 } from './payment-state-store.js';
 import { computeCanonicalInvocationHash } from './canonical-identity.js';
 import type { PaymentProcessor, ServerPaymentsContext } from './types.js';
@@ -353,9 +355,17 @@ describe('server boundaries and transparent replay', () => {
     });
 
     test(`${mode}: backend admission failure cannot mint an invoice or dispatch`, async () => {
-      const store = new InMemoryPaymentStateStore();
-      store.admit = async () => {
-        throw new Error('database unavailable');
+      const store: PaymentStateStore = {
+        policy: createPaymentStatePolicy(),
+        async admit() {
+          throw new Error('storage unavailable');
+        },
+        async transition() {
+          return false;
+        },
+        async read() {
+          return undefined;
+        },
       };
       let sideEffects = 0;
       const options: ServerPaymentsOptions = {
@@ -390,7 +400,7 @@ describe('server boundaries and transparent replay', () => {
             sideEffects++;
           },
         ),
-      ).rejects.toThrow('database unavailable');
+      ).rejects.toThrow('storage unavailable');
       expect(sideEffects).toBe(0);
     });
   }

@@ -166,7 +166,9 @@ export function createExplicitGatingMiddleware(
         PAYMENT_CAPACITY_ERROR_CODE,
         admitted.status === 'capacity'
           ? 'Payment capacity reached, retry later'
-          : `Payment admission refused: ${admitted.status}`,
+          : admitted.status === 'expired'
+            ? 'Paid authorization expired; contact the server operator to reconcile the payment before paying again'
+            : `Payment admission refused: ${admitted.status}`,
         { reason: `payment_${admitted.status}` },
       );
       return;

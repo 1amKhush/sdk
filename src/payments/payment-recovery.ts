@@ -147,7 +147,9 @@ export function paymentRecoveryStatus(
 
 let publicationSequence = 0;
 
-/** Durable result publication journal; publication retries never invoke application handlers. */
+/** Store-backed publication journal; retries never invoke application handlers.
+ * The default in-memory store retains results only for the lifetime of that store.
+ */
 export class PaymentResultRecovery implements PaymentResultJournal {
   public constructor(
     private readonly store: PaymentStateStore,

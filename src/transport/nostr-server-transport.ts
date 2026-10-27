@@ -1,4 +1,4 @@
-import { PaymentResultRecovery } from '../payments/payment-recovery.js';
+import type { PaymentResultRecovery } from '../payments/payment-recovery.js';
 import {
   type ListToolsResult,
   isJSONRPCNotification,
@@ -816,7 +816,7 @@ export class NostrServerTransport
    * popped by duplicate-delivery cleanup or the idle paying client's session
    * was LRU-evicted while payment settled (CEP-8).
    */
-  /** Attaches the same durable payment store used by authorization to result publication. */
+  /** Uses the authorization store for result publication; persistence depends on that store. */
   public setPaymentResultRecovery(recovery: PaymentResultRecovery): void {
     this.paymentResultRecovery = recovery;
     this.outboundResponseRouter.setPaymentResultJournal(recovery);
