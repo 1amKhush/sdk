@@ -94,6 +94,8 @@ export type PaymentStateTransition = {
  * Atomic payment storage contract. Backend errors propagate, including uncertain
  * commit acknowledgement; callers must not retry external effects or fall back
  * to a fresh memory store. A consumed execution right is never auto-restored.
+ * Applications may inject their own implementation through `stateStore` and
+ * own its dependencies and lifecycle. Only the in-memory implementation is bundled.
  */
 export interface PaymentStateStore {
   readonly policy: PaymentStatePolicy;
